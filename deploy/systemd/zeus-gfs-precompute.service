@@ -1,0 +1,38 @@
+[Unit]
+Description=Zeus scheduled GFS forecast precompute
+Documentation=file:/Zeus/tools/run_scheduled_gfs_precompute.py
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/Zeus/tools/run_scheduled_gfs_precompute.py
+ConditionPathExists=/root/miniconda3/envs/zeus-fourvar/bin/python
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/Zeus
+
+Environment=PYTHONPATH=/Zeus
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/root/miniconda3/envs/zeus-fourvar/bin/python /Zeus/tools/run_scheduled_gfs_precompute.py \
+  --hotkey 5HVyUksh8kEDvMAFTCsSuX5t2pUwXDuFmU2Ju5oyG2CvigJR \
+  --cache-dir /Zeus/data/gfs_cache \
+  --store-dir /Zeus/data/forecast_store_v2 \
+  --work-dir /Zeus/data/gfs_precompute_work \
+  --metadata-dir /Zeus/data/gfs_precompute_metadata \
+  --offsets 6,12,18,24 \
+  --retention-days 24 \
+  --max-run-age-hours 24 \
+  --max-lateness-minutes 20
+
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+TimeoutStartSec=45min
+KillSignal=SIGTERM
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal

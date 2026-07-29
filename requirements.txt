@@ -33,3 +33,10 @@ netCDF4==1.7.4
 openmeteo-requests==1.3.0
 blosc2==4.0.0
 lmdb==1.7.5
+
+# Four-variable GFS miner integration
+herbie-data>=2025.6.0
+cfgrib>=0.9.15.0
+eccodes>=2.38.0
+
+scipy==1.18.0
