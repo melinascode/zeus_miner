@@ -13,6 +13,7 @@ Welcome to the Zeus Subnet! This repository contains all the necessary informati
 - [Mining Guide ⛏️](docs/Mining.md)
 - [Incentive mechanism 🎁](docs/ScoringChallengesCalculatingWeights.ipynb)
 - [Validator Guide 🔧](docs/Validating.md)
+- [Validator-faithful offline evaluation](docs/OfflineEvaluation.md)
 
 > [!IMPORTANT]
 > If you are new to Bittensor, we recommend familiarizing yourself with the basics on the [Bittensor Website](https://bittensor.com/) before proceeding.

@@ -596,6 +596,13 @@ def run(args: argparse.Namespace) -> dict:
             max_run_age_hours=(
                 args.max_run_age_hours
             ),
+            sflux_priority=tuple(
+                getattr(
+                    args,
+                    "sflux_priority",
+                    ["nomads"],
+                )
+            ),
         )
 
         outputs: dict[str, np.memmap] = {}
@@ -845,11 +852,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=24,
     )
 
+    parser.add_argument(
+        "--sflux-priority",
+        default="nomads",
+        help=(
+            "Comma-separated Herbie sources for sfluxgrb. "
+            "Use 'aws,nomads' for historical evaluation archives."
+        ),
+    )
+
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    if isinstance(args.sflux_priority, str):
+        args.sflux_priority = [
+            part.strip()
+            for part in args.sflux_priority.split(",")
+            if part.strip()
+        ]
     run(args)
 
 

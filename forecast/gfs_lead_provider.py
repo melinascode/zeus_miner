@@ -32,11 +32,17 @@ class GFSLeadForecastProvider(GFSWeatherDataProvider):
         product: str = "pgrb2.0p25",
         max_run_age_hours: int = 18,
         cache_directory: str | Path = "data/gfs_lead_cache",
+        sflux_priority: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         super().__init__(
             product=product,
             max_run_age_hours=max_run_age_hours,
             cache_directory=cache_directory,
+        )
+        # Live/near-real-time defaults to NOMADS. Historical evaluation must
+        # include AWS because NOMADS only retains about ten days.
+        self.sflux_priority = list(
+            sflux_priority if sflux_priority is not None else ("nomads",)
         )
 
     @classmethod
@@ -87,7 +93,7 @@ class GFSLeadForecastProvider(GFSWeatherDataProvider):
         }
 
         if is_surface_flux:
-            kwargs["priority"] = ["nomads"]
+            kwargs["priority"] = list(self.sflux_priority)
 
         herbie = Herbie(
             self._as_naive_utc(cycle_time),

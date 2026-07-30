@@ -188,3 +188,27 @@ miner.env
 *.retired-*
 
 /data/
+
+# Secrets and local configuration
+miner.env
+validator.env
+.env
+.env.*
+
+# Runtime and downloaded data
+data/
+logs/
+.pytest_cache/
+.vscode/
+__pycache__/
+*.pyc
+*.log
+*.grib
+*.grib2
+*.idx
+*.nc
+*.npy
+*.npz
+*.memmap
+*.tar.gz
+*.zip
