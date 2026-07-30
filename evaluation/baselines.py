@@ -7,7 +7,16 @@ import torch
 def persistence_from_initial_field(
     forecast: torch.Tensor | np.ndarray,
 ) -> torch.Tensor:
-    """Repeat candidate H000 without using future ground truth."""
+    """Repeat the target-time field from the production-selected GFS cycle.
+
+    The input must already be the Zeus-aligned raw GFS artifact for the
+    historical production source-selection (newest ready cycle among offsets
+    6/12/18/24), lead mapping, and interpolation. Persistence repeats that
+    artifact's H000 (Zeus lead 0 / target-time field) across the horizon.
+
+    Never use ERA5 H000 or any post-issue observation as the persistence
+    initial field.
+    """
 
     if isinstance(forecast, torch.Tensor):
         tensor = forecast.detach().to(device="cpu")

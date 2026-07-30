@@ -61,7 +61,14 @@ def test_locked_selection_loads_and_rejects_mutation() -> None:
     selection = load_selection(SELECTION_PATH)
     assert len(selection["test_cycles"]) == 30
     assert selection["content_sha256"] == content_sha256(selection)
-    assert selection["overlap_proof"]["truth_gap_hours"] == 168
+    assert selection["overlap_proof"]["truth_gap_hours"] == 2328
+    assert selection["calibration"]["n_issue_cycles"] == 360
+    assert len(selection["calibration"]["issue_cycles"]) == 360
+    assert selection["disk_safety"]["min_free_gib"] == 80
+    assert selection["coefficients_frozen"] is False
+    assert selection["content_sha256"] == (
+        "6cbbe92a19fd502a516457c6acff9c03e82b5d12db21987cbe32e99a23d41cf0"
+    )
 
     mutated = copy.deepcopy(selection)
     mutated["test_cycles"][0]["cycle"] = "20250422T120000Z"
@@ -98,6 +105,64 @@ def test_assert_no_test_cycle_in_fit() -> None:
             ["20250422T180000Z"],
             ["20250422T180000Z", "20250508T000000Z"],
         )
+
+
+def test_bias_accumulator_pools_weighted_residuals(tmp_path: Path) -> None:
+    """bias = Σ mask·L·(Y−F) / Σ mask·L across cycles (not mean-of-means)."""
+    weights_path = tmp_path / "lat.npy"
+    # Two latitudes with unequal weight so pooling differs from unweighted mean.
+    np.save(weights_path, np.array([1.0, 3.0], dtype=np.float64))
+    accumulator = BiasAccumulator(
+        latitude_weights_path=weights_path,
+        n_leads=2,
+    )
+    # Cycle A: residual +1 everywhere; Cycle B: residual +3 on heavy lat only,
+    # masked (nan) on light lat — must pool, not average cycle means equally.
+    for residual_a, residual_b_heavy in ((1.0, 3.0),):
+        for hour in (0, 6, 12, 18):
+            for variable in (
+                "2m_temperature",
+                "100m_u_component_of_wind",
+                "100m_v_component_of_wind",
+                "surface_solar_radiation_downwards",
+            ):
+                forecast = np.zeros((2, 2, 2), dtype=np.float64)
+                truth_a = np.full((2, 2, 2), residual_a, dtype=np.float64)
+                accumulator.update(
+                    variable=variable,
+                    cycle_time=datetime(2024, 3, 1, hour, tzinfo=timezone.utc),
+                    forecast=forecast,
+                    truth=truth_a,
+                )
+                truth_b = np.full((2, 2, 2), np.nan, dtype=np.float64)
+                truth_b[:, 1, :] = residual_b_heavy
+                forecast_b = np.zeros((2, 2, 2), dtype=np.float64)
+                accumulator.update(
+                    variable=variable,
+                    cycle_time=datetime(2024, 6, 1, hour, tzinfo=timezone.utc),
+                    forecast=forecast_b,
+                    truth=truth_b,
+                )
+
+    frozen = accumulator.freeze(selection_sha256="d" * 64)
+    # Cycle A mass: (1+3)*2 lons = 8 per lead; contrib 1*8 = 8
+    # Cycle B mass: 3*2 = 6; contrib 3*6 = 18
+    # bias = (8+18)/(8+6) = 26/14
+    expected = 26.0 / 14.0
+    for hour in ("0", "6", "12", "18"):
+        values = frozen.payload["biases"]["2m_temperature"][hour]
+        assert values[0] == pytest.approx(expected)
+        assert values[1] == pytest.approx(expected)
+
+
+def test_disk_safety_gate(tmp_path: Path) -> None:
+    from evaluation.disk_safety import assert_disk_safety, free_gib
+
+    available = free_gib(tmp_path)
+    assert available > 0
+    assert_disk_safety(tmp_path, min_free_gib=1.0)
+    with pytest.raises(RuntimeError, match="Disk safety gate"):
+        assert_disk_safety(tmp_path, min_free_gib=available + 1000.0)
 
 
 def test_bias_accumulator_and_frozen_apply(tmp_path: Path) -> None:

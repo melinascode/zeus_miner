@@ -28,12 +28,25 @@ FORMULA_TYPE = "additive_lead_hour_bias_synoptic_stratified"
 
 @dataclass
 class BiasAccumulator:
-    """Accumulate latitude-weighted mean (truth − forecast) on calib only."""
+    """Accumulate pooled latitude-weighted bias (ERA5 − raw_GFS) on calib only.
+
+    For each lead and synoptic hour::
+
+        numerator   = Σ mask · latitude_weight · (truth − forecast)
+        denominator = Σ mask · latitude_weight
+        bias        = numerator / denominator
+
+    Sums run over all calibration cycles, latitudes, and longitudes with
+    ``mask`` true where both forecast and truth are finite.
+    """
 
     latitude_weights_path: Path = LATITUDE_WEIGHTS_PATH
     n_leads: int = LONG_REQUESTED_HOURS
     _latitude_weights: np.ndarray | None = field(default=None, init=False, repr=False)
-    _sums: dict[str, dict[int, np.ndarray]] = field(
+    _numerators: dict[str, dict[int, np.ndarray]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _denominators: dict[str, dict[int, np.ndarray]] = field(
         default_factory=dict, init=False, repr=False
     )
     _counts: dict[str, dict[int, int]] = field(
@@ -43,7 +56,11 @@ class BiasAccumulator:
     def __post_init__(self) -> None:
         self.latitude_weights_path = Path(self.latitude_weights_path)
         for variable in SUPPORTED_VARIABLES:
-            self._sums[variable] = {
+            self._numerators[variable] = {
+                hour: np.zeros(self.n_leads, dtype=np.float64)
+                for hour in CYCLE_HOURS
+            }
+            self._denominators[variable] = {
                 hour: np.zeros(self.n_leads, dtype=np.float64)
                 for hour in CYCLE_HOURS
             }
@@ -99,16 +116,17 @@ class BiasAccumulator:
             raise ValueError(
                 "Forecast latitude dimension does not match latitude weights."
             )
-        if not np.isfinite(forecast_array).all() or not np.isfinite(
-            truth_array
-        ).all():
-            raise ValueError("Calibration tensors must be finite.")
+        mask = np.isfinite(forecast_array) & np.isfinite(truth_array)
+        if not mask.any():
+            raise ValueError("Calibration tensors have no valid (finite) cells.")
 
-        residual = truth_array - forecast_array
-        weights = self.latitude_weights.reshape(-1, 1)
-        denominator = float(weights.sum() * residual.shape[2])
-        lead_means = (residual * weights).sum(axis=(1, 2)) / denominator
-        self._sums[variable][cycle_hour] += lead_means
+        residual = np.where(mask, truth_array - forecast_array, 0.0)
+        weights = self.latitude_weights.reshape(1, -1, 1)
+        sample_weight = mask.astype(np.float64) * weights
+        self._numerators[variable][cycle_hour] += (residual * sample_weight).sum(
+            axis=(1, 2)
+        )
+        self._denominators[variable][cycle_hour] += sample_weight.sum(axis=(1, 2))
         self._counts[variable][cycle_hour] += 1
 
     def freeze(
@@ -130,7 +148,12 @@ class BiasAccumulator:
                         f"No calibration samples for {variable} at "
                         f"{hour:02d}Z."
                     )
-                mean = self._sums[variable][hour] / float(count)
+                denominator = self._denominators[variable][hour]
+                if np.any(denominator <= 0.0):
+                    raise ValueError(
+                        f"Zero weighted mass for {variable} at {hour:02d}Z."
+                    )
+                mean = self._numerators[variable][hour] / denominator
                 biases[variable][str(hour)] = [
                     float(value) for value in mean.tolist()
                 ]
@@ -145,7 +168,11 @@ class BiasAccumulator:
                 "weights": "latitude_only",
                 "region_weights": False,
                 "solar_clip_min": 0.0,
-                "expression": "F_cal = F_raw + b[V,h,c]; solar: max(0, F_cal)",
+                "expression": (
+                    "b = Σ mask·L·(ERA5−raw_GFS) / Σ mask·L; "
+                    "F_cal = F_raw + b[V,h,c]; solar: max(0, F_cal)"
+                ),
+                "pooling": "global_over_calib_cycles_lats_lons",
             },
             "variables": list(SUPPORTED_VARIABLES),
             "cycle_hours": list(CYCLE_HOURS),

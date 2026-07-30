@@ -104,6 +104,23 @@ def validate_selection(payload: dict[str, Any]) -> None:
         raise ValueError(
             "calibration.truth_end does not match issue_end + long horizon."
         )
+    if "issue_cycles" in calibration:
+        listed = calibration_issue_times(payload)
+        if listed[0] != calib_start or listed[-1] != calib_end:
+            raise ValueError(
+                "calibration.issue_start/issue_end must match first/last "
+                "issue_cycles."
+            )
+        if len(listed) != int(calibration["n_issue_cycles"]):
+            raise ValueError("calibration.n_issue_cycles mismatches issue_cycles.")
+    min_free = payload.get("disk_safety", {}).get("min_free_gib")
+    if min_free is not None and float(min_free) < 80:
+        raise ValueError("disk_safety.min_free_gib must be at least 80.")
+    if payload.get("coefficients_frozen") is True:
+        raise ValueError(
+            "Selection must not freeze calibration coefficients before "
+            "revised design and pilots pass."
+        )
 
 
 def assert_selection_unchanged(
@@ -176,20 +193,34 @@ def record_cycle_status(
 
 def calibration_issue_times(selection: dict[str, Any]) -> tuple[datetime, ...]:
     calibration = selection["calibration"]
+    expected = int(calibration["n_issue_cycles"])
+    if "issue_cycles" in calibration:
+        issues = tuple(
+            _parse_cycle(value) for value in calibration["issue_cycles"]
+        )
+        if len(issues) != expected:
+            raise ValueError(
+                f"Expected {expected} calibration issues, listed {len(issues)}."
+            )
+        if len(set(issues)) != len(issues):
+            raise ValueError("Calibration issue_cycles contains duplicates.")
+        if issues != tuple(sorted(issues)):
+            raise ValueError("Calibration issue_cycles must be sorted ascending.")
+        return issues
+
     start = _parse_cycle(calibration["issue_start"])
     end = _parse_cycle(calibration["issue_end"])
     step = timedelta(hours=int(calibration["issue_step_hours"]))
-    issues: list[datetime] = []
+    issues_list: list[datetime] = []
     current = start
     while current <= end:
-        issues.append(current)
+        issues_list.append(current)
         current += step
-    expected = int(calibration["n_issue_cycles"])
-    if len(issues) != expected:
+    if len(issues_list) != expected:
         raise ValueError(
-            f"Expected {expected} calibration issues, built {len(issues)}."
+            f"Expected {expected} calibration issues, built {len(issues_list)}."
         )
-    return tuple(issues)
+    return tuple(issues_list)
 
 
 def test_cycle_times(selection: dict[str, Any]) -> tuple[datetime, ...]:
