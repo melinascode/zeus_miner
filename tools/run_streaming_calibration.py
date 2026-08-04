@@ -402,10 +402,12 @@ def _prune_era5_outside_lookahead(
     *,
     protect_test_era5: bool,
 ) -> None:
-    """Delete calib-only ERA5 days not needed by the next few issues.
+    """Delete 2024 calib-only ERA5 days not needed by the next few issues.
 
-    Never deletes days on/after the first test truth start (2025-04-22) when
-    protect_test_era5 is set — those belong to the locked test windows.
+    When protect_test_era5 is set, never delete any ERA5 day in 2025 or later
+    (covers early-2025 calib truth tails and the locked test windows).
+    Only 2024 days outside the upcoming lookahead may be removed under disk
+    pressure.
     """
     from evaluation.disk_safety import free_gib
 
@@ -418,7 +420,6 @@ def _prune_era5_outside_lookahead(
         while day <= end:
             needed.add(day.isoformat())
             day += timedelta(days=1)
-    protect_from = datetime(2025, 4, 22, tzinfo=timezone.utc).date()
     for variable in variables:
         var_dir = era5_dir / variable
         if not var_dir.is_dir():
@@ -431,12 +432,10 @@ def _prune_era5_outside_lookahead(
                 day_date = datetime.strptime(day, "%Y-%m-%d").date()
             except ValueError:
                 continue
-            if protect_test_era5 and day_date >= protect_from:
+            if protect_test_era5 and day_date.year >= 2025:
                 continue
-            # Only prune 2024-era calib days.
-            if day_date.year == 2024 or (
-                day_date.year == 2025 and day_date < protect_from
-            ):
+            # Only prune 2024 calib days outside lookahead.
+            if day_date.year == 2024:
                 path.unlink(missing_ok=True)
 
 
