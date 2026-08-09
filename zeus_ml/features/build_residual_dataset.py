@@ -112,6 +112,29 @@ def build_single_residual():
         residual.std().item()
     )
 
+    output_dir = Path(
+        "/Zeus/data/evaluation/residual_ml"
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    output_file = (
+        output_dir /
+        "u100_residual_20250422T180000Z.pt"
+    )
+
+    torch.save(
+        residual,
+        output_file
+    )
+
+    print(
+        "Saved:",
+        output_file
+    )
 
 if __name__ == "__main__":
     build_single_residual()
