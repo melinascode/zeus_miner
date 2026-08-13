@@ -129,6 +129,58 @@ class BiasAccumulator:
         self._denominators[variable][cycle_hour] += sample_weight.sum(axis=(1, 2))
         self._counts[variable][cycle_hour] += 1
 
+    def per_cycle_denominators(self) -> dict[str, dict[int, np.ndarray]]:
+        """Return per-lead spatial weight sums for each variable and synoptic hour."""
+        return {
+            variable: {
+                hour: self._denominators[variable][hour].copy()
+                for hour in CYCLE_HOURS
+            }
+            for variable in SUPPORTED_VARIABLES
+        }
+
+    def seed_from_frozen(
+        self,
+        frozen: "FrozenCalibration",
+        *,
+        per_cycle_denominators: Mapping[str, Mapping[int, np.ndarray]],
+    ) -> dict[str, list[str]]:
+        """Restore running sums from frozen means and one-cycle denominators."""
+        payload = frozen.payload
+        fitted_issue_cycles = payload.get("fitted_issue_cycles") or {}
+        fitted: dict[str, list[str]] = {}
+        for variable in SUPPORTED_VARIABLES:
+            cycles = list(fitted_issue_cycles.get(variable, []))
+            if not cycles:
+                raise ValueError(
+                    f"Frozen coefficients missing fitted_issue_cycles for {variable}."
+                )
+            fitted[variable] = cycles
+            for hour in CYCLE_HOURS:
+                count = int(payload["sample_counts"][variable][str(hour)])
+                if count < 1:
+                    raise ValueError(
+                        f"No frozen sample count for {variable} at {hour:02d}Z."
+                    )
+                mean = np.asarray(
+                    payload["biases"][variable][str(hour)],
+                    dtype=np.float64,
+                )
+                den_per_cycle = np.asarray(
+                    per_cycle_denominators[variable][hour],
+                    dtype=np.float64,
+                )
+                if den_per_cycle.shape != mean.shape:
+                    raise ValueError(
+                        f"Denominator shape {den_per_cycle.shape} does not match "
+                        f"bias shape {mean.shape} for {variable} at {hour:02d}Z."
+                    )
+                total_den = den_per_cycle * count
+                self._numerators[variable][hour] = mean * total_den
+                self._denominators[variable][hour] = total_den
+                self._counts[variable][hour] = count
+        return fitted
+
     def freeze(
         self,
         *,
@@ -223,15 +275,21 @@ class FrozenCalibration:
             )
         return np.asarray(values[:n_leads], dtype=np.float32)
 
-    def write(self, path: str | Path) -> Path:
+    def write(
+        self,
+        path: str | Path,
+        *,
+        allow_overwrite: bool = False,
+    ) -> Path:
         destination = Path(path)
         if destination.exists():
             existing = json.loads(destination.read_text(encoding="utf-8"))
             if existing == self.payload:
                 return destination
-            raise FileExistsError(
-                f"Refusing to overwrite different coefficients: {destination}"
-            )
+            if not allow_overwrite:
+                raise FileExistsError(
+                    f"Refusing to overwrite different coefficients: {destination}"
+                )
         destination.parent.mkdir(parents=True, exist_ok=True)
         content = canonical_json_bytes(self.payload)
         temporary = destination.with_suffix(destination.suffix + ".tmp")

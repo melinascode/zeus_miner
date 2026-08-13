@@ -72,6 +72,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resume from status; reload accumulator checkpoint if present.",
     )
+    parser.add_argument(
+        "--allow-refreeze",
+        action="store_true",
+        help=(
+            "Allow overwriting an existing frozen coefficients file after "
+            "retrying failed cycles."
+        ),
+    )
     return parser
 
 
@@ -80,6 +88,7 @@ def main() -> int:
     from evaluation.artifacts import ForecastArtifactReader
     from evaluation.calibration import (
         BiasAccumulator,
+        FrozenCalibration,
         assert_no_test_cycle_in_fit,
     )
     from evaluation.disk_safety import assert_disk_safety, free_gib
@@ -107,6 +116,15 @@ def main() -> int:
         ".accumulator.npz"
     )
     meta_path = Path(str(checkpoint_path) + ".meta.json")
+    variables = tuple(selection["variables"])
+    Path(args.calib_store_dir).mkdir(parents=True, exist_ok=True)
+    (Path(args.calib_store_dir) / "bundles").mkdir(parents=True, exist_ok=True)
+    reader = ForecastArtifactReader(
+        args.calib_store_dir,
+        require_complete_bundle=False,
+    )
+    truth_loader = Era5TruthLoader()
+
     accumulator = BiasAccumulator()
     fitted: dict[str, list[str]] = defaultdict(list)
     if args.resume and checkpoint_path.is_file() and meta_path.is_file():
@@ -118,15 +136,59 @@ def main() -> int:
             f"{ {k: len(v) for k, v in fitted.items()} }",
             flush=True,
         )
+    elif args.resume:
+        failed_keys = [
+            key
+            for key, entry in status["cycles"].items()
+            if entry.get("status") == "failed"
+        ]
+        coefficients_path = Path(args.coefficients_out)
+        if failed_keys and coefficients_path.is_file():
+            if not args.allow_refreeze:
+                raise SystemExit(
+                    "Failed cycles remain and frozen coefficients exist; "
+                    "pass --allow-refreeze to seed, retry, and overwrite."
+                )
+            frozen = FrozenCalibration.load(
+                coefficients_path,
+                expected_selection_sha256=selection_sha256,
+            )
+            ref_cycle_key = _reference_cycle_key(frozen)
+            fitted_cycles = frozen.payload.get("fitted_issue_cycles", {}).get(
+                variables[0],
+                [],
+            )
+            print(
+                f"Seeding accumulator from frozen coefficients "
+                f"({len(fitted_cycles)} cycles); reference denominators "
+                f"from {ref_cycle_key}",
+                flush=True,
+            )
+            per_cycle_denominators = _measure_per_cycle_denominators(
+                args=args,
+                cycle_key=ref_cycle_key,
+                variables=variables,
+                hotkey=args.hotkey,
+                truth_loader=truth_loader,
+                reader=reader,
+            )
+            fitted = accumulator.seed_from_frozen(
+                frozen,
+                per_cycle_denominators=per_cycle_denominators,
+            )
+            print(
+                f"Seeded accumulator; fitted samples="
+                f"{ {k: len(v) for k, v in fitted.items()} }",
+                flush=True,
+            )
+            status["summary"] = {
+                **(status.get("summary") or {}),
+                "frozen": False,
+                "reason": "retrying_failed_cycles",
+            }
+            status.pop("coefficients_sha256", None)
+            _write_status(status_path, status)
 
-    Path(args.calib_store_dir).mkdir(parents=True, exist_ok=True)
-    (Path(args.calib_store_dir) / "bundles").mkdir(parents=True, exist_ok=True)
-    reader = ForecastArtifactReader(
-        args.calib_store_dir,
-        require_complete_bundle=False,
-    )
-    truth_loader = Era5TruthLoader()
-    variables = tuple(selection["variables"])
     processed = 0
 
     for index, cycle in enumerate(issues):
@@ -289,7 +351,10 @@ def main() -> int:
         plan_id=selection["plan_id"],
         fitted_issue_cycles=dict(fitted),
     )
-    destination = frozen.write(args.coefficients_out)
+    destination = frozen.write(
+        args.coefficients_out,
+        allow_overwrite=args.allow_refreeze,
+    )
     status["coefficients_path"] = str(destination)
     status["coefficients_sha256"] = frozen.coefficients_sha256
     status["summary"] = {
@@ -310,6 +375,115 @@ def main() -> int:
         meta_path.unlink()
     print(json.dumps(status["summary"], indent=2, sort_keys=True), flush=True)
     return 0
+
+
+def _reference_cycle_key(frozen: FrozenCalibration) -> str:
+    fitted = frozen.payload.get("fitted_issue_cycles") or {}
+    for cycles in fitted.values():
+        if cycles:
+            return sorted(cycles)[0]
+    raise ValueError("Frozen coefficients contain no fitted_issue_cycles.")
+
+
+def _measure_per_cycle_denominators(
+    *,
+    args: argparse.Namespace,
+    cycle_key: str,
+    variables: tuple[str, ...],
+    hotkey: str,
+    truth_loader,
+    reader,
+) -> dict[str, dict[int, "np.ndarray"]]:
+    import numpy as np
+
+    from evaluation.calibration import BiasAccumulator, CYCLE_HOURS
+
+    cycle = datetime.strptime(cycle_key, "%Y%m%dT%H%M%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    _ensure_era5_window(
+        Path(args.era5_dir),
+        variables,
+        cycle,
+        horizon_hours=360,
+    )
+    offset = int(args.assume_offset)
+    source = cycle - timedelta(hours=offset)
+    source_key = source.strftime("%Y%m%dT%H%M%SZ")
+    calib_store = Path(args.calib_store_dir)
+    _remove_bundle(calib_store, cycle_key)
+    cmd = [
+        sys.executable,
+        str(PROJECT_ROOT / "tools" / "build_historical_gfs_bundle.py"),
+        "--target-cycle",
+        cycle_key,
+        "--gfs-cycle",
+        source_key,
+        "--hotkey",
+        hotkey,
+        "--store-dir",
+        str(calib_store),
+        "--cache-dir",
+        str(args.cache_dir),
+        "--work-dir",
+        f"data/evaluation/gfs_work_calib/{cycle_key}_seed_ref",
+        "--retention-days",
+        "500",
+        "--max-run-age-hours",
+        str(24 * 500),
+        "--sflux-priority",
+        "aws,nomads",
+    ]
+    print(f"REFERENCE BUILD {cycle_key} for denominator seed", flush=True)
+    completed = subprocess.run(cmd, cwd=PROJECT_ROOT)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"Reference build for {cycle_key} exit_code={completed.returncode}"
+        )
+
+    manifest_path = calib_store / "bundles" / cycle_key / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    probe = BiasAccumulator()
+    cycle_hour = cycle.hour
+    for variable in variables:
+        state_key = f"{variable}@0_360"
+        commitment = manifest["artifacts"][state_key]["commitment_hash"]
+        artifact = reader.read(
+            cycle,
+            variable,
+            360,
+            expected_hotkey=hotkey,
+            expected_commitment_hash=commitment,
+            expected_manifest_sha256=manifest_sha,
+        )
+        truth_files = _truth_files(Path(args.era5_dir), variable, cycle, 360)
+        truth = truth_loader.load(
+            truth_files,
+            variable=variable,
+            cycle_time=cycle,
+            horizon_hours=360,
+        )
+        probe.update(
+            variable=variable,
+            cycle_time=cycle,
+            forecast=artifact.tensor,
+            truth=truth.tensor,
+        )
+
+    measured = probe.per_cycle_denominators()
+    replicated = {
+        variable: {
+            hour: measured[variable][cycle_hour].copy()
+            for hour in CYCLE_HOURS
+        }
+        for variable in variables
+    }
+    _remove_bundle(calib_store, cycle_key)
+    work = Path(f"data/evaluation/gfs_work_calib/{cycle_key}_seed_ref")
+    if work.exists():
+        shutil.rmtree(work, ignore_errors=True)
+    return replicated
 
 
 def _ensure_era5_window(
