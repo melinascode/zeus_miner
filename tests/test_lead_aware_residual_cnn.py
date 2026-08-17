@@ -9,6 +9,7 @@ import torch
 from zeus_ml.datasets.lead_aware_patch_dataset import (
     ChannelStatistics,
     LeadAwarePatchDataset,
+    sample_patch_origins,
 )
 from zeus_ml.evaluate.evaluate_lead_aware_residual_cnn import (
     StreamingValidatorMetrics,
@@ -20,6 +21,8 @@ from zeus_ml.models.lead_aware_residual_cnn import (
     LeadAwareGatedResidualCNN,
     build_static_features,
     build_temporal_context,
+    crop_zonal_profile,
+    horizon_mix_from_context,
 )
 
 
@@ -44,7 +47,11 @@ def test_model_starts_close_to_raw_forecast() -> None:
         initial_gate=0.02,
     )
     weather = torch.randn(2, 4, 16, 24)
-    context = torch.randn(2, 7)
+    context = build_temporal_context(
+        torch.zeros(2),
+        torch.zeros(2),
+        torch.ones(2),
+    )
     static = build_static_features(
         torch.linspace(-20.0, 20.0, 16),
         torch.linspace(-30.0, 30.0, 24),
@@ -53,7 +60,9 @@ def test_model_starts_close_to_raw_forecast() -> None:
     assert output.correction.shape == weather.shape
     assert output.gate.shape == weather.shape
     assert output.ungated_residual.shape == weather.shape
-    assert float(output.gate.mean().detach()) == pytest.approx(0.02, abs=1e-5)
+    assert output.zonal_gate.shape[:2] == (2, 4)
+    assert float(output.gate.mean().detach()) == pytest.approx(0.02, abs=1e-4)
+    assert float(output.horizon_mix.mean().detach()) < 0.05
     assert sum(parameter.numel() for parameter in model.parameters()) < 1_000_000
 
 
@@ -155,6 +164,10 @@ def test_patch_dataset_returns_context_and_normalized_fields(tmp_path) -> None:
     np.save(cycle_dir / "lead_hours.npy", np.array([12], dtype=np.int16))
     np.save(cycle_dir / "lat_starts.npy", np.array([[100]], dtype=np.int32))
     np.save(cycle_dir / "lon_starts.npy", np.array([[200]], dtype=np.int32))
+    np.save(
+        cycle_dir / "zonal_means.npy",
+        np.full((1, 4, 721), 10.0, dtype=np.float16),
+    )
     (cycle_dir / "metadata.json").write_text(
         json.dumps(
             {
@@ -189,3 +202,80 @@ def test_patch_dataset_returns_context_and_normalized_fields(tmp_path) -> None:
     assert sample["context"].shape == (7,)
     assert sample["static_features"].shape == (5, 4, 4)
     assert sample["metric_weights"].shape == (1, 4, 4)
+    assert sample["zonal_mean"].shape == (4, 721)
+    assert sample["lat_start"].ndim == 0
+
+
+def test_long_horizon_heads_open_the_gate() -> None:
+    model = LeadAwareGatedResidualCNN(
+        hidden_channels=8,
+        dilations=(1, 2),
+        dropout=0.0,
+        initial_gate=0.02,
+    )
+    weather = torch.zeros(2, 4, 8, 8)
+    static = build_static_features(
+        torch.linspace(-10.0, 10.0, 8),
+        torch.linspace(-10.0, 10.0, 8),
+    )
+    short = model(
+        weather,
+        build_temporal_context(torch.zeros(2), torch.zeros(2), torch.ones(2)),
+        static,
+    )
+    long = model(
+        weather,
+        build_temporal_context(
+            torch.full((2,), 360.0),
+            torch.zeros(2),
+            torch.ones(2),
+        ),
+        static,
+    )
+    assert float(short.horizon_mix.mean().detach()) < 0.05
+    assert float(long.horizon_mix.mean().detach()) > 0.95
+    assert float(long.gate.mean().detach()) > float(short.gate.mean().detach())
+
+
+def test_zonal_profile_is_cropped_to_patch_latitudes() -> None:
+    profile = torch.arange(721, dtype=torch.float32).view(1, 1, 721).expand(1, 4, 721).clone()
+    cropped = crop_zonal_profile(
+        profile,
+        torch.tensor([100]),
+        16,
+    )
+    assert cropped.shape == (1, 4, 16)
+    assert float(cropped[0, 0, 0]) == 100.0
+    assert float(cropped[0, 0, -1]) == 115.0
+
+
+def test_patch_origins_cover_europe_and_germany() -> None:
+    lat_starts, lon_starts = sample_patch_origins(
+        np.random.default_rng(7),
+        n_leads=3,
+        patches_per_lead=4,
+        patch_size=128,
+        include_germany=True,
+    )
+    assert lat_starts.shape == (3, 4)
+    europe_lat = -90.0 + (lat_starts[:, 0] + 64) * 0.25
+    europe_lon = -180.0 + (lon_starts[:, 0] + 64) * 0.25
+    germany_lat = -90.0 + (lat_starts[:, 1] + 64) * 0.25
+    germany_lon = -180.0 + (lon_starts[:, 1] + 64) * 0.25
+    assert np.all((europe_lat >= 34.0) & (europe_lat <= 72.0))
+    assert np.all((europe_lon >= -25.0) & (europe_lon <= 45.0))
+    assert np.all((germany_lat >= 47.0) & (germany_lat <= 56.0))
+    assert np.all((germany_lon >= 6.0) & (germany_lon <= 15.0))
+
+
+def test_horizon_mix_is_near_zero_then_one() -> None:
+    mix = horizon_mix_from_context(
+        build_temporal_context(
+            torch.tensor([0.0, 48.0, 360.0]),
+            torch.zeros(3),
+            torch.ones(3),
+        )
+    )
+    assert float(mix[0]) < 0.03
+    assert float(mix[1]) == pytest.approx(0.5, abs=0.05)
+    assert float(mix[2]) > 0.99

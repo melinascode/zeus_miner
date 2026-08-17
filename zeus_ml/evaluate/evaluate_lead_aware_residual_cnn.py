@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-plan",
         default=(
             "data/evaluation/plans/"
-            "cnn_residual_v2_development_split.json"
+            "cnn_residual_v3_user_split.json"
         ),
     )
     parser.add_argument(
@@ -250,6 +250,8 @@ def evaluate_cycle(
                 model_input.unsqueeze(0),
                 context,
                 static_features,
+                zonal_mean=model_input.mean(dim=-1, keepdim=False).unsqueeze(0),
+                lat_starts=torch.zeros(1, dtype=torch.long, device=device),
             )
             correction = output.correction[0] * residual_std
             corrected = raw + correction

@@ -17,6 +17,9 @@ VARIABLES = (
 )
 CONTEXT_FEATURES = 7
 STATIC_CHANNELS = 5
+FULL_LATITUDE_SIZE = 721
+SHORT_HORIZON_HOURS = 48.0
+HORIZON_MIX_SCALE_HOURS = 12.0
 
 
 def build_temporal_context(
@@ -181,11 +184,107 @@ class LeadConditionedBlock(nn.Module):
         return x + self.dropout(residual)
 
 
+def horizon_mix_from_context(context: torch.Tensor) -> torch.Tensor:
+    """Return a smooth 0–1 weight that activates the long-horizon heads."""
+
+    lead_hours = context[:, 0] * 360.0
+    return torch.sigmoid(
+        (lead_hours - SHORT_HORIZON_HOURS) / HORIZON_MIX_SCALE_HOURS
+    )
+
+
+def crop_zonal_profile(
+    profile: torch.Tensor,
+    lat_starts: torch.Tensor,
+    height: int,
+) -> torch.Tensor:
+    """Slice a full-latitude zonal profile to each sample's patch latitudes."""
+
+    if profile.ndim != 3:
+        raise ValueError("zonal profile must have shape (batch, channel, latitude).")
+    if profile.shape[-1] == height:
+        return profile
+    if profile.shape[-1] != FULL_LATITUDE_SIZE:
+        raise ValueError(
+            "Zonal profile must cover the full latitude grid or the patch height."
+        )
+    slices = [
+        profile[index, :, int(start) : int(start) + height]
+        for index, start in enumerate(lat_starts.tolist())
+    ]
+    cropped = torch.stack(slices, dim=0)
+    if cropped.shape[-1] != height:
+        raise ValueError("Zonal crop does not match the weather latitude size.")
+    return cropped
+
+
+class ZonalBiasBranch(nn.Module):
+    """Per-latitude residual from the full-globe zonal-mean GFS profile."""
+
+    def __init__(
+        self,
+        *,
+        weather_channels: int,
+        context_channels: int,
+        hidden_channels: int,
+    ) -> None:
+        super().__init__()
+        self.stem = nn.Conv1d(
+            weather_channels,
+            hidden_channels,
+            kernel_size=9,
+            padding=4,
+        )
+        self.norm = nn.GroupNorm(_group_count(hidden_channels), hidden_channels)
+        self.film = nn.Linear(context_channels, hidden_channels * 2)
+        self.block = nn.Conv1d(
+            hidden_channels,
+            hidden_channels,
+            kernel_size=5,
+            padding=2,
+        )
+        self.head = nn.Conv1d(hidden_channels, weather_channels, kernel_size=1)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(
+        self,
+        zonal_mean: torch.Tensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = self.norm(self.stem(zonal_mean))
+        scale, shift = self.film(context).chunk(2, dim=-1)
+        hidden = hidden * (1.0 + scale[:, :, None]) + shift[:, :, None]
+        hidden = F.silu(hidden)
+        hidden = F.silu(self.block(hidden))
+        return self.head(hidden)
+
+
+class ResidualHeads(nn.Module):
+    def __init__(self, hidden_channels: int) -> None:
+        super().__init__()
+        self.temperature = nn.Conv2d(hidden_channels, 1, kernel_size=1)
+        self.wind = nn.Conv2d(hidden_channels, 2, kernel_size=1)
+        self.solar = nn.Conv2d(hidden_channels, 1, kernel_size=1)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            (
+                self.temperature(features),
+                self.wind(features),
+                self.solar(features),
+            ),
+            dim=1,
+        )
+
+
 @dataclass(frozen=True)
 class GatedResidualOutput:
     correction: torch.Tensor
     gate: torch.Tensor
     ungated_residual: torch.Tensor
+    zonal_gate: torch.Tensor
+    horizon_mix: torch.Tensor
 
 
 class LeadAwareGatedResidualCNN(nn.Module):
@@ -229,11 +328,17 @@ class LeadAwareGatedResidualCNN(nn.Module):
             )
             for dilation in self.dilations
         )
-        self.temperature_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
-        self.wind_head = nn.Conv2d(hidden_channels, 2, kernel_size=1)
-        self.solar_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
+        self.short_heads = ResidualHeads(hidden_channels)
+        self.long_heads = ResidualHeads(hidden_channels)
         self.spatial_gate = nn.Conv2d(hidden_channels, 4, kernel_size=1)
         self.context_gate = nn.Linear(context_channels, 4)
+        self.long_lead_gate_gain = nn.Parameter(torch.tensor(2.0))
+        self.zonal_branch = ZonalBiasBranch(
+            weather_channels=weather_channels,
+            context_channels=context_channels,
+            hidden_channels=hidden_channels,
+        )
+        self.zonal_context_gate = nn.Linear(context_channels, 4)
         self._initialize_gate(initial_gate)
 
     @property
@@ -246,12 +351,17 @@ class LeadAwareGatedResidualCNN(nn.Module):
         nn.init.constant_(self.spatial_gate.bias, logit)
         nn.init.zeros_(self.context_gate.weight)
         nn.init.zeros_(self.context_gate.bias)
+        zonal_logit = torch.logit(torch.tensor(0.05)).item()
+        nn.init.zeros_(self.zonal_context_gate.weight)
+        nn.init.constant_(self.zonal_context_gate.bias, zonal_logit)
 
     def forward(
         self,
         weather: torch.Tensor,
         context: torch.Tensor,
         static_features: torch.Tensor,
+        zonal_mean: torch.Tensor | None = None,
+        lat_starts: torch.Tensor | None = None,
     ) -> GatedResidualOutput:
         if weather.ndim != 4:
             raise ValueError("weather must have shape (batch, channel, lat, lon).")
@@ -289,19 +399,33 @@ class LeadAwareGatedResidualCNN(nn.Module):
         features = self.stem(torch.cat((weather, static_features), dim=1))
         for block in self.blocks:
             features = block(features, context)
-        residual = torch.cat(
-            (
-                self.temperature_head(features),
-                self.wind_head(features),
-                self.solar_head(features),
-            ),
-            dim=1,
-        )
+        horizon_mix = horizon_mix_from_context(context).view(-1, 1, 1, 1)
+        residual = (1.0 - horizon_mix) * self.short_heads(features)
+        residual = residual + horizon_mix * self.long_heads(features)
         gate_logits = self.spatial_gate(features)
         gate_logits = gate_logits + self.context_gate(context)[:, :, None, None]
+        gate_logits = (
+            gate_logits
+            + self.long_lead_gate_gain * context[:, :1, None, None]
+        )
         gate = torch.sigmoid(gate_logits)
+        if zonal_mean is None:
+            zonal_mean = weather.mean(dim=-1)
+        if lat_starts is None:
+            lat_starts = weather.new_zeros(weather.shape[0], dtype=torch.long)
+        zonal_profile = self.zonal_branch(zonal_mean, context)
+        zonal_profile = crop_zonal_profile(
+            zonal_profile,
+            lat_starts,
+            weather.shape[-2],
+        )
+        zonal_gate = torch.sigmoid(self.zonal_context_gate(context))
+        zonal_gate = zonal_gate[:, :, None, None]
+        zonal_correction = zonal_profile.unsqueeze(-1) * zonal_gate
         return GatedResidualOutput(
-            correction=residual * gate,
+            correction=residual * gate + zonal_correction,
             gate=gate,
             ungated_residual=residual,
+            zonal_gate=zonal_gate,
+            horizon_mix=horizon_mix,
         )

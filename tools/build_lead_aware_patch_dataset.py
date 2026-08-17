@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from evaluation.truth import Era5TruthLoader
 from evaluation.scoring import ValidatorFaithfulScorer
+from zeus_ml.datasets.lead_aware_patch_dataset import sample_patch_origins
 from zeus_ml.features.era5_files import find_era5_files
 from zeus_ml.features.gfs_loader import load_gfs_artifact
 from zeus_ml.models.lead_aware_residual_cnn import VARIABLES
@@ -49,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--horizon", type=int, choices=(48, 360), default=360)
     parser.add_argument("--patch-size", type=int, default=128)
-    parser.add_argument("--patches-per-lead", type=int, default=4)
+    parser.add_argument("--patches-per-lead", type=int, default=6)
     parser.add_argument("--seed", type=int, default=20260813)
     parser.add_argument("--overwrite", action="store_true")
     return parser
@@ -155,17 +156,19 @@ def build_cycle(
     if patches_per_lead < 1:
         raise ValueError("patches_per_lead must be positive.")
     rng = np.random.default_rng(seed)
-    lat_starts = rng.integers(
-        0,
-        full_height - patch_size + 1,
-        size=(n_leads, patches_per_lead),
-        dtype=np.int32,
+    include_germany = ValidatorFaithfulScorer.region_regime(cycle) == (
+        "europe_germany"
     )
-    lon_starts = rng.integers(
-        0,
-        full_width - patch_size + 1,
-        size=(n_leads, patches_per_lead),
-        dtype=np.int32,
+    lat_starts, lon_starts = sample_patch_origins(
+        rng,
+        n_leads=n_leads,
+        patches_per_lead=patches_per_lead,
+        patch_size=patch_size,
+        include_germany=include_germany,
+    )
+    zonal_means = np.zeros(
+        (n_leads, len(VARIABLES), full_height),
+        dtype=np.float16,
     )
     shape = (
         n_leads,
@@ -207,6 +210,9 @@ def build_cycle(
             raise ValueError(
                 f"Unexpected GFS shape for {variable}: {tuple(gfs.shape)}"
             )
+        zonal_means[:, variable_index] = (
+            gfs.mean(dim=-1).numpy().astype(np.float16, copy=False)
+        )
         if truth.shape != gfs.shape:
             raise ValueError(
                 f"Truth shape {tuple(truth.shape)} does not match GFS "
@@ -244,6 +250,7 @@ def build_cycle(
     )
     np.save(temporary / "lat_starts.npy", lat_starts)
     np.save(temporary / "lon_starts.npy", lon_starts)
+    np.save(temporary / "zonal_means.npy", zonal_means)
     metadata = {
         "schema_version": 1,
         "cycle": cycle_key,
@@ -253,6 +260,7 @@ def build_cycle(
         "full_shape": [full_height, full_width],
         "patch_size": patch_size,
         "patches_per_lead": patches_per_lead,
+        "sampling": "validator_weighted_with_region_guarantees",
         "seed": seed,
         "split_plan": split_plan,
         "split_plan_sha256": split_plan_sha256,
