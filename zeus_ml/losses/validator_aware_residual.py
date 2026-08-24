@@ -42,15 +42,25 @@ class ValidatorAwareResidualLoss(nn.Module):
         correction_weight: float = 1e-4,
         gate_weight: float = 1e-4,
         epsilon: float = 1e-8,
+        variable_weights: tuple[float, ...] = VARIABLE_WEIGHTS,
+        solar_channel: int | None = SOLAR_CHANNEL,
     ) -> None:
         super().__init__()
+        if not variable_weights:
+            raise ValueError("variable_weights must not be empty.")
+        if solar_channel is not None and not 0 <= solar_channel < len(
+            variable_weights
+        ):
+            raise ValueError("solar_channel must index into variable_weights.")
+        self.variable_count = len(variable_weights)
+        self.solar_channel = solar_channel
         self.no_regret_weight = no_regret_weight
         self.correction_weight = correction_weight
         self.gate_weight = gate_weight
         self.epsilon = epsilon
         self.register_buffer(
             "variable_weights",
-            torch.tensor(VARIABLE_WEIGHTS, dtype=torch.float32),
+            torch.tensor(variable_weights, dtype=torch.float32),
         )
 
     def forward(
@@ -70,17 +80,19 @@ class ValidatorAwareResidualLoss(nn.Module):
             gate,
             metric_weights,
             residual_scales,
+            self.variable_count,
         )
         physical_correction = correction * residual_scales
         corrected = raw_forecast + physical_correction
-        corrected_solar = corrected[:, SOLAR_CHANNEL].clamp_min(0.0)
-        corrected = torch.cat(
-            (
-                corrected[:, :SOLAR_CHANNEL],
-                corrected_solar.unsqueeze(1),
-            ),
-            dim=1,
-        )
+        if self.solar_channel is not None:
+            # Downwelling solar radiation cannot be negative.
+            is_solar = torch.zeros(
+                (1, corrected.shape[1], 1, 1),
+                dtype=torch.bool,
+                device=corrected.device,
+            )
+            is_solar[0, self.solar_channel] = True
+            corrected = torch.where(is_solar, corrected.clamp_min(0.0), corrected)
         corrected_per_variable = self._combined_error(
             corrected,
             truth,
@@ -94,7 +106,9 @@ class ValidatorAwareResidualLoss(nn.Module):
         variable_weights = self.variable_weights.view(1, -1)
         # Errors have incompatible physical units (K, m/s, W/m²). Normalize
         # each variable by its training residual RMS before combining them.
-        loss_scales = residual_scales.reshape(1, 4).clamp_min(self.epsilon)
+        loss_scales = residual_scales.reshape(1, self.variable_count).clamp_min(
+            self.epsilon
+        )
         corrected_normalized = corrected_per_variable / loss_scales
         raw_normalized = raw_per_variable / loss_scales
         corrected_metric = (
@@ -148,11 +162,13 @@ class ValidatorAwareResidualLoss(nn.Module):
         gate: torch.Tensor,
         metric_weights: torch.Tensor,
         residual_scales: torch.Tensor,
+        variable_count: int,
     ) -> None:
         expected = raw_forecast.shape
-        if raw_forecast.ndim != 4 or expected[1] != 4:
+        if raw_forecast.ndim != 4 or expected[1] != variable_count:
             raise ValueError(
-                "raw_forecast must have shape (batch, 4, latitude, longitude)."
+                f"raw_forecast must have shape (batch, {variable_count}, "
+                "latitude, longitude)."
             )
         for name, value in (
             ("truth", truth),
@@ -167,16 +183,20 @@ class ValidatorAwareResidualLoss(nn.Module):
             )
         if metric_weights.shape[0] != expected[0]:
             raise ValueError("metric_weights batch does not match forecast.")
-        if metric_weights.shape[1] not in (1, 4):
-            raise ValueError("metric_weights must have one or four channels.")
+        if metric_weights.shape[1] not in (1, variable_count):
+            raise ValueError(
+                f"metric_weights must have one or {variable_count} channels."
+            )
         if metric_weights.shape[2:] != expected[2:]:
             raise ValueError("metric_weights grid does not match forecast.")
         if tuple(residual_scales.shape) not in (
-            (4,),
-            (1, 4, 1, 1),
-            (4, 1, 1),
+            (variable_count,),
+            (1, variable_count, 1, 1),
+            (variable_count, 1, 1),
         ):
-            raise ValueError("residual_scales must broadcast over four channels.")
+            raise ValueError(
+                f"residual_scales must broadcast over {variable_count} channels."
+            )
         if not all(
             torch.isfinite(value).all()
             for value in (
