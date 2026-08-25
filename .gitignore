@@ -212,3 +212,5 @@ __pycache__/
 *.memmap
 *.tar.gz
 *.zip
+.agents/
+skills-lock.json
