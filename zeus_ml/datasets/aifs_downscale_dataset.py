@@ -21,7 +21,11 @@ import xarray as xr
 from torch.utils.data import Dataset, Sampler
 
 from zeus.utils.coordinates import get_grid
-from zeus.utils.region_mask import REGION_CONFIGS, build_geographic_weights
+from zeus.utils.region_mask import (
+    REGION_CONFIGS,
+    build_geographic_weights,
+    geographic_scalar_for_variable,
+)
 from zeus.validator.constants import (
     EUROPE_LATITUDE_RANGE,
     EUROPE_LONGITUDE_RANGE,
@@ -209,6 +213,7 @@ class AifsDownscaleDataset(Dataset):
         grib_cache_size: int = 2,
         use_lagged: bool = False,
         ens_root: str | Path | None = None,
+        geo_mode: str = "boxes",
     ) -> None:
         # With ens_root the primary forecast is the ENS mean and the paired
         # ("lagged") channels carry the same-day AIFS Single run instead of
@@ -245,6 +250,24 @@ class AifsDownscaleDataset(Dataset):
         self.global_metric_mean = float(
             (latitude_weight[:, None] * self.geographic).mean()
         )
+        if geo_mode == "official":
+            # Post-2026-08-25 validator metric: per-variable capacity scalars,
+            # each normalized by its own global mean like custom_rmse does on
+            # full-globe challenges. Channels follow VARIABLES (t2m, u100, v100).
+            channels = []
+            for variable in ("2m_temperature", "100m_u_component_of_wind",
+                             "100m_v_component_of_wind"):
+                metric = latitude_weight[:, None] * geographic_scalar_for_variable(
+                    variable
+                )
+                channels.append(metric / metric.mean())
+            self.metric_map = torch.stack(channels)
+        elif geo_mode == "boxes":
+            self.metric_map = (
+                latitude_weight[:, None] * self.geographic / self.global_metric_mean
+            ).unsqueeze(0)
+        else:
+            raise ValueError(f"Unknown geo_mode {geo_mode!r}")
         self.cycle_times = [
             datetime.strptime(key, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
             for key in self.cycles
@@ -377,10 +400,6 @@ class AifsDownscaleDataset(Dataset):
             zenith=fields["zenith"],
             zenith_anomaly=fields["zenith_anomaly"],
         )
-        metric = (
-            torch.cos(torch.deg2rad(self.latitudes)).clamp_min(0.0)[:, None]
-            * self.geographic
-        ) / self.global_metric_mean
         return {
             "cycle_key": fields["cycle_key"],
             "lead_hour": torch.tensor([float(lead)]),
@@ -391,7 +410,7 @@ class AifsDownscaleDataset(Dataset):
             "raw": fields["interpolated"].unsqueeze(0),
             "truth": fields["truth"].unsqueeze(0),
             "static_features": static.unsqueeze(0),
-            "metric_weights": metric.unsqueeze(0).unsqueeze(0),
+            "metric_weights": self.metric_map.unsqueeze(0),
         }
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
@@ -440,9 +459,7 @@ class AifsDownscaleDataset(Dataset):
                 zenith=crop(zenith),
                 zenith_anomaly=crop(zenith_anomaly),
             )
-            metric = (
-                torch.cos(torch.deg2rad(latitudes)).clamp_min(0.0)[:, None] * geo_tile
-            ) / self.global_metric_mean
+            metric = crop(self.metric_map)
             model_input = self._normalize_input(
                 raw_tile,
                 delta_tile,
@@ -452,7 +469,7 @@ class AifsDownscaleDataset(Dataset):
             truth_tiles.append(truth_tile)
             input_tiles.append(model_input)
             static_tiles.append(static_tile)
-            weight_tiles.append(metric.unsqueeze(0))
+            weight_tiles.append(metric)
 
         group = len(origins)
         return {

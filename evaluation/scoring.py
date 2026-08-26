@@ -14,10 +14,14 @@ from zeus.utils.region_mask import (
     OLD_REGION_CONFIGS,
     REGION_CONFIGS,
     build_geographic_weights,
+    geographic_scalar_for_variable,
 )
 from zeus.validator.constants import LATITUDE_WEIGHTS_PATH
 from zeus.validator.metrics import _weighted_mae, _weighted_rmse
-from zeus.validator.reward import _OLD_EUROPE_WEIGHT_CUTOFF_TS
+from zeus.validator.reward import (
+    _CAPACITY_SCALAR_CUTOFF_TS,
+    _OLD_EUROPE_WEIGHT_CUTOFF_TS,
+)
 
 
 DEFAULT_SPATIAL_SHAPE = (721, 1440)
@@ -61,6 +65,7 @@ class ValidatorFaithfulScorer:
         cycle_time: datetime,
         latitude_weights: torch.Tensor | np.ndarray | None = None,
         geographic_weights: torch.Tensor | np.ndarray | None = None,
+        variable: str | None = None,
     ) -> ScoreResult:
         truth_tensor = self._to_float32(truth)
         if truth_tensor.ndim != 3:
@@ -90,6 +95,7 @@ class ValidatorFaithfulScorer:
         geographic_tensor = self._geographic_weights(
             cycle_time,
             geographic_weights,
+            variable=variable,
         )
         combined_weights = (
             latitude_tensor.view(1, -1, 1)
@@ -162,11 +168,11 @@ class ValidatorFaithfulScorer:
     @staticmethod
     def region_regime(cycle_time: datetime) -> str:
         timestamp = ValidatorFaithfulScorer._as_utc(cycle_time).timestamp()
-        return (
-            "europe_only"
-            if timestamp < _OLD_EUROPE_WEIGHT_CUTOFF_TS
-            else "europe_germany"
-        )
+        if timestamp < _OLD_EUROPE_WEIGHT_CUTOFF_TS:
+            return "europe_only"
+        if timestamp < _CAPACITY_SCALAR_CUTOFF_TS:
+            return "europe_germany"
+        return "capacity_scalars"
 
     def _latitude_weights(
         self,
@@ -190,15 +196,22 @@ class ValidatorFaithfulScorer:
         self,
         cycle_time: datetime,
         override: torch.Tensor | np.ndarray | None,
+        variable: str | None = None,
     ) -> torch.Tensor:
         if override is None:
             if self.spatial_shape != DEFAULT_SPATIAL_SHAPE:
                 raise ValueError(
                     "Custom spatial shapes require geographic_weights."
                 )
-            weights = self._cached_geographic_weights(
-                self.region_regime(cycle_time)
-            )
+            regime = self.region_regime(cycle_time)
+            if regime == "capacity_scalars":
+                if variable is None:
+                    raise ValueError(
+                        "variable is required when scoring with capacity scalars."
+                    )
+                weights = self._cached_capacity_scalars(variable)
+            else:
+                weights = self._cached_geographic_weights(regime)
         else:
             weights = self._to_float32(override)
         if tuple(weights.shape) != self.spatial_shape:
@@ -222,6 +235,11 @@ class ValidatorFaithfulScorer:
             else REGION_CONFIGS
         )
         return build_geographic_weights(grid, configs).contiguous()
+
+    @staticmethod
+    @lru_cache(maxsize=4)
+    def _cached_capacity_scalars(variable: str) -> torch.Tensor:
+        return geographic_scalar_for_variable(variable).contiguous()
 
     @staticmethod
     def _to_float32(value: torch.Tensor | np.ndarray) -> torch.Tensor:

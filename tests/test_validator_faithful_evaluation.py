@@ -44,9 +44,9 @@ class SmallGridScorer(ValidatorFaithfulScorer):
             else self._small_latitude
         )
 
-    def _geographic_weights(self, cycle_time, override):
+    def _geographic_weights(self, cycle_time, override, variable=None):
         return (
-            super()._geographic_weights(cycle_time, override)
+            super()._geographic_weights(cycle_time, override, variable=variable)
             if override is not None
             else self._small_geographic
         )

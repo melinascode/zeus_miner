@@ -214,3 +214,4 @@ __pycache__/
 *.zip
 .agents/
 skills-lock.json
+zeus_reference/

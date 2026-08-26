@@ -199,6 +199,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Reuse a statistics JSON from a previous run.",
     )
+    parser.add_argument(
+        "--geo-mode",
+        choices=("boxes", "official"),
+        default="boxes",
+        help="Loss metric weights: Europe/Germany boxes (pre-2026-08-25 rules) "
+        "or the official per-variable capacity scalars.",
+    )
     parser.add_argument("--learning-rate", type=float, default=3e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--no-regret-weight", type=float, default=0.5)
@@ -250,6 +257,7 @@ def main() -> int:
         europe_fraction=args.europe_fraction,
         use_lagged=args.use_lagged,
         grib_cache_size=3 if args.use_lagged else 2,
+        geo_mode=args.geo_mode,
     )
     stats_path = output_root / f"{args.name}.statistics.json"
     if args.statistics_from and not stats_path.is_file():
@@ -407,6 +415,7 @@ def main() -> int:
                         "weather_channels": weather_channels,
                         "use_lagged": args.use_lagged,
                         "ens_mode": bool(args.ens_root),
+                        "geo_mode": args.geo_mode,
                         "epoch": epoch,
                         "metrics": metrics,
                     },
