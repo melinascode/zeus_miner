@@ -14,7 +14,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Sequence
 
-import eccodes
 import numpy as np
 import torch
 import xarray as xr
@@ -90,6 +89,8 @@ class AifsCycleReader:
 
     @staticmethod
     def _decode(path: Path) -> np.ndarray:
+        import eccodes
+
         out = np.zeros((N_STEPS, len(VARIABLES), FULL_HEIGHT, FULL_WIDTH), np.float16)
         seen = np.zeros((N_STEPS, len(VARIABLES)), bool)
         index = {name: i for i, name in enumerate(GRIB_SHORT_NAMES)}
@@ -499,6 +500,7 @@ class CycleBlockSampler(Sampler[int]):
         cycles_per_epoch: int,
         leads_per_cycle: int,
         seed: int = 0,
+        midhour_boost: float = 0.0,
     ) -> None:
         self.n_cycles = len(dataset.cycles)
         self.n_leads = MAX_LEAD_HOURS + 1
@@ -506,6 +508,11 @@ class CycleBlockSampler(Sampler[int]):
         self.leads_per_cycle = min(int(leads_per_cycle), self.n_leads)
         self.seed = int(seed)
         self.epoch = 0
+        # Production pays 15-19% extra MAE at hours off the 6h model steps;
+        # midhour_boost > 0 oversamples those leads during training.
+        weights = np.ones(self.n_leads, dtype=np.float64)
+        weights[np.arange(self.n_leads) % 6 != 0] += float(midhour_boost)
+        self.lead_probs = weights / weights.sum()
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -517,7 +524,12 @@ class CycleBlockSampler(Sampler[int]):
         rng = np.random.default_rng(self.seed + 1000 * self.epoch)
         cycles = rng.permutation(self.n_cycles)[: self.cycles_per_epoch]
         for cycle in cycles:
-            leads = rng.choice(self.n_leads, size=self.leads_per_cycle, replace=False)
+            leads = rng.choice(
+                self.n_leads,
+                size=self.leads_per_cycle,
+                replace=False,
+                p=self.lead_probs,
+            )
             for lead in leads:
                 yield int(cycle) * self.n_leads + int(lead)
 

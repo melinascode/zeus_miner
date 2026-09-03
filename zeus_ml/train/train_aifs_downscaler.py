@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader
 from zeus_ml.datasets.aifs_downscale_dataset import (
     AifsDownscaleDataset,
     CycleBlockSampler,
+    Era5HourlyReader,
     estimate_statistics,
 )
 from zeus_ml.losses.validator_aware_residual import ValidatorAwareResidualLoss
@@ -119,6 +120,7 @@ def evaluate(
     dataset: AifsDownscaleDataset,
     entries: list[tuple],
     residual_scales: torch.Tensor,
+    device: torch.device = torch.device("cpu"),
 ) -> dict[str, float]:
     model.eval()
     corrected_sum = np.zeros(len(VARIABLES))
@@ -126,18 +128,23 @@ def evaluate(
     gate_sum = 0.0
     for cycle, lead in entries:
         item = dataset.full_globe_item(cycle, lead)
-        output = model(
-            item["model_input"], item["context"], item["static_features"]
-        )
+        item = {k: v.to(device) if torch.is_tensor(v) else v
+                for k, v in item.items()}
+        with torch.no_grad():
+            output = model(
+                item["model_input"], item["context"], item["static_features"]
+            )
         corrected = item["raw"] + output.correction * residual_scales
         corrected_sum += (
             combined_error(corrected, item["truth"], item["metric_weights"])
             .squeeze(0)
+            .cpu()
             .numpy()
         )
         raw_sum += (
             combined_error(item["raw"], item["truth"], item["metric_weights"])
             .squeeze(0)
+            .cpu()
             .numpy()
         )
         gate_sum += float(output.gate.mean())
@@ -209,6 +216,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=3e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--no-regret-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--mae-weight",
+        type=float,
+        default=0.5,
+        help="Weight of the MAE term inside the combined loss "
+        "(0.5 = validator metric; >0.5 tilts toward MAE).",
+    )
+    parser.add_argument(
+        "--midhour-boost",
+        type=float,
+        default=0.0,
+        help="Oversample leads off the 6h steps by this factor.",
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
     parser.add_argument("--europe-fraction", type=float, default=0.35)
     parser.add_argument("--validation-cycles", type=int, default=12)
     parser.add_argument("--validation-per-cycle", type=int, default=6)
@@ -231,6 +255,31 @@ def main() -> int:
         all_cycles = sorted(p.stem for p in Path(args.ens_root).glob("*.npy"))
     else:
         all_cycles = sorted(p.stem for p in Path(args.aifs_root).glob("*.grib2"))
+    era5_reader = Era5HourlyReader(args.era5_root)
+    kept = []
+    skipped = 0
+    for key in all_cycles:
+        cycle_time = datetime.strptime(key, "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        days_ok = all(
+            era5_reader.has(cycle_time + timedelta(hours=hour))
+            for hour in range(0, MAX_LEAD_HOURS + 1, 24)
+        )
+        if days_ok:
+            kept.append(key)
+        else:
+            skipped += 1
+    all_cycles = kept
+    print(
+        f"ERA5 coverage: {len(all_cycles)} usable cycles, {skipped} skipped",
+        flush=True,
+    )
+    if len(all_cycles) < 8:
+        raise SystemExit(
+            "Not enough cycles with full ERA5 windows to train. "
+            "Fetch more ERA5 days and retry."
+        )
     if args.drop_after:
         limit = datetime.fromisoformat(args.drop_after).replace(tzinfo=timezone.utc)
         all_cycles = [
@@ -290,6 +339,7 @@ def main() -> int:
         cycles_per_epoch=args.cycles_per_epoch,
         leads_per_cycle=args.leads_per_cycle,
         seed=args.seed,
+        midhour_boost=args.midhour_boost,
     )
     loader = DataLoader(
         train_dataset,
@@ -315,15 +365,19 @@ def main() -> int:
             flush=True,
         )
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"model: {n_params} parameters, tile {args.tile_size}", flush=True)
+    device = torch.device(args.device)
+    model = model.to(device)
+    print(f"model: {n_params} parameters, tile {args.tile_size}, "
+          f"device {device}", flush=True)
     criterion = ValidatorAwareResidualLoss(
         variable_weights=VARIABLE_WEIGHTS,
         solar_channel=None,
         no_regret_weight=args.no_regret_weight,
-    )
+        mae_weight=args.mae_weight,
+    ).to(device)
     residual_scales = torch.tensor(statistics.residual_std, dtype=torch.float32).view(
         len(VARIABLES), 1, 1
-    )
+    ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
@@ -339,7 +393,7 @@ def main() -> int:
         f"validating baseline on {len(val_entries)} full-globe samples ...",
         flush=True,
     )
-    baseline = evaluate(model, val_dataset, val_entries, residual_scales)
+    baseline = evaluate(model, val_dataset, val_entries, residual_scales, device)
     print(
         "  linear interpolation combined error  "
         + "  ".join(f"{k}={baseline[f'{k}_baseline']:.4f}" for k in SHORT_NAMES),
@@ -357,6 +411,10 @@ def main() -> int:
             t_epoch = time.time()
             running = {"loss": 0.0, "no_regret": 0.0, "gate": 0.0}
             for step, item in enumerate(loader, start=1):
+                item = {
+                    k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
+                    for k, v in item.items()
+                }
                 output = model(
                     item["model_input"], item["context"], item["static_features"]
                 )
@@ -386,7 +444,9 @@ def main() -> int:
                         f"({(time.time()-t_epoch)/step:.2f}s/step)",
                         flush=True,
                     )
-            metrics = evaluate(model, val_dataset, val_entries, residual_scales)
+            metrics = evaluate(
+                model, val_dataset, val_entries, residual_scales, device
+            )
             metrics["epoch"] = epoch
             metrics["train_loss"] = running["loss"] / max(steps_per_epoch, 1)
             metrics["seconds"] = time.time() - t_epoch

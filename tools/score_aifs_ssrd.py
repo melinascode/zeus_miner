@@ -78,17 +78,26 @@ def reconstruct_hourly(
     latitudes: torch.Tensor,
     longitudes: torch.Tensor,
     zenith_samples: int,
+    step_hours: int = STEP_HOURS,
 ) -> np.ndarray:
-    """Hourly mean W/m², shape (361, 721, 1440). Lead 0 is zero."""
+    """Hourly mean W/m², shape (step_hours*(n-1)+1, 721, 1440). Lead 0 is zero.
 
-    hourly = np.zeros((MAX_LEAD_HOURS + 1, FULL_HEIGHT, FULL_WIDTH), np.float32)
-    for index in range(1, N_STEPS):
-        start = (index - 1) * STEP_HOURS
-        end = index * STEP_HOURS
+    ``accumulated`` rows are the cumulative J/m² at 0, step_hours,
+    2*step_hours, ... (61 rows of 6h steps for a full AIFS run; 21 rows of
+    3h steps for the IFS 0..60h window).
+    """
+
+    n_steps = accumulated.shape[0]
+    hourly = np.zeros(
+        (step_hours * (n_steps - 1) + 1, FULL_HEIGHT, FULL_WIDTH), np.float32
+    )
+    for index in range(1, n_steps):
+        start = (index - 1) * step_hours
+        end = index * step_hours
         energy = np.clip(accumulated[index] - accumulated[index - 1], 0.0, None)
         leads = list(range(start + 1, end + 1))
         if method == "constant":
-            flux = (energy / (STEP_HOURS * SECONDS_PER_HOUR)).astype(np.float32)
+            flux = (energy / (step_hours * SECONDS_PER_HOUR)).astype(np.float32)
             for lead in leads:
                 hourly[lead] = flux
             continue
@@ -105,7 +114,7 @@ def reconstruct_hourly(
         total = np.sum(weights, axis=0)
         safe = np.maximum(total, ZENITH_FLOOR)
         for lead, weight in zip(leads, weights):
-            scale = np.where(total > ZENITH_FLOOR, weight / safe, 1.0 / STEP_HOURS)
+            scale = np.where(total > ZENITH_FLOOR, weight / safe, 1.0 / step_hours)
             hourly[lead] = (energy * scale / SECONDS_PER_HOUR).astype(np.float32)
     return hourly
 

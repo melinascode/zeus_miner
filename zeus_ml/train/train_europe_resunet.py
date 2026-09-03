@@ -48,11 +48,15 @@ from zeus_ml.models.germany_resunet import (
 )
 
 SHORT_NAMES = ("t2m", "u100", "v100")
+# One two-week block per season. The June block is the only summer block
+# inside the ENS range (2025-09-03..): without it the ENS-native fine-tune
+# validates on autumn/winter/spring only and summer regressions go unseen.
 VALIDATION_BLOCKS = (
     ("2025-07-15", "2025-07-28"),
     ("2025-10-15", "2025-10-28"),
     ("2026-01-14", "2026-01-27"),
     ("2026-04-08", "2026-04-21"),
+    ("2026-06-10", "2026-06-23"),
 )
 BUFFER_DAYS = 15
 GERMANY_LAT = (47.0, 56.0)
@@ -435,6 +439,7 @@ def evaluate(
     entries: list[tuple[int, int]],
     residual_scales: torch.Tensor,
     device: torch.device,
+    variable_weights: tuple[float, ...] = VARIABLE_WEIGHTS,
 ) -> dict[str, float]:
     was_training = model.training
     model.eval()
@@ -459,7 +464,7 @@ def evaluate(
         model.train()
     corrected_mean = corrected_sum / max(used, 1)
     raw_mean = raw_sum / max(used, 1)
-    weights_np = np.asarray(VARIABLE_WEIGHTS)
+    weights_np = np.asarray(variable_weights)
     metrics: dict[str, float] = {"val_samples": float(used)}
     for i, key in enumerate(SHORT_NAMES):
         metrics[f"{key}_corrected"] = float(corrected_mean[i])
@@ -533,6 +538,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="ladder: sample leads proportional to Zeus incentive mass "
         "(leads <=48h ~2.8x). uniform: previous behavior.",
     )
+    parser.add_argument(
+        "--variable-weights",
+        default=None,
+        help="Comma list overriding loss/val variable weights, e.g. '1,0,0' "
+        "for a t2m-only specialist (wind gates stay closed via no-regret).",
+    )
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument(
         "--patience",
@@ -561,10 +572,16 @@ def main() -> int:
     metrics_path = output_root / f"{args.name}.metrics.jsonl"
 
     statistics = json.loads(Path(args.statistics).read_text(encoding="utf-8"))
-    manifest = json.loads(
-        (Path(args.data_root) / "manifest.json").read_text(encoding="utf-8")
+    # List cycles from the directory, not the manifest: the daily ENS backfill
+    # lands new .npy files without rewriting manifest.json.
+    all_cycles = sorted(
+        p.stem for p in (Path(args.data_root) / args.source).glob("*.npy")
     )
-    all_cycles = manifest[f"{args.source}_cycles"]
+    if not all_cycles:
+        manifest = json.loads(
+            (Path(args.data_root) / "manifest.json").read_text(encoding="utf-8")
+        )
+        all_cycles = manifest[f"{args.source}_cycles"]
     train_cycles, val_cycles = build_split(all_cycles, args.drop_after)
     print(
         f"{args.source}: {len(all_cycles)} cycles -> {len(train_cycles)} train, "
@@ -632,11 +649,20 @@ def main() -> int:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model: {n_params / 1e6:.2f}M parameters on {device}", flush=True)
 
+    if args.variable_weights:
+        variable_weights = tuple(
+            float(x) for x in args.variable_weights.split(",")
+        )
+        if len(variable_weights) != 3:
+            raise ValueError("--variable-weights needs 3 comma-separated values")
+        print(f"variable weights override: {variable_weights}", flush=True)
+    else:
+        variable_weights = VARIABLE_WEIGHTS
     criterion = ValidatorAwareResidualLoss(
-        variable_weights=VARIABLE_WEIGHTS,
+        variable_weights=variable_weights,
         solar_channel=None,
         no_regret_weight=args.no_regret_weight,
-    )
+    ).to(device)
     residual_scales = (
         torch.tensor(train_dataset.residual_std, dtype=torch.float32)
         .view(1, 3, 1, 1)
@@ -662,7 +688,9 @@ def main() -> int:
         persistent_workers=args.num_workers > 0,
     )
 
-    baseline = evaluate(model, val_dataset, val_entries, residual_scales, device)
+    baseline = evaluate(
+        model, val_dataset, val_entries, residual_scales, device, variable_weights
+    )
     print(
         "baseline (gate closed) "
         + " ".join(f"{k}={baseline[f'{k}_baseline']:.4f}" for k in SHORT_NAMES),
@@ -678,7 +706,10 @@ def main() -> int:
     ).to(device)
     ema_model.eval()
 
-    best = math.inf
+    # Floor at the identity score (corrected == raw -> weighted == 1.0): never
+    # save a checkpoint that is worse than serving the plain interpolation.
+    # The first ENS fine-tune started at inf and checkpointed weighted > 1.
+    best = float(sum(variable_weights))
     best_epoch = -1
     with metrics_path.open("a", encoding="utf-8") as log:
         log.write(json.dumps({"event": "baseline", "metrics": baseline}) + "\n")
@@ -719,11 +750,13 @@ def main() -> int:
                         flush=True,
                     )
             raw_metrics = evaluate(
-                model, val_dataset, val_entries, residual_scales, device
+                model, val_dataset, val_entries, residual_scales, device,
+                variable_weights,
             )
             ema.copy_to(ema_model)
             ema_metrics = evaluate(
-                ema_model, val_dataset, val_entries, residual_scales, device
+                ema_model, val_dataset, val_entries, residual_scales, device,
+                variable_weights,
             )
             use_ema = (
                 ema_metrics["weighted_corrected"]
@@ -764,6 +797,7 @@ def main() -> int:
                         "source": args.source,
                         "domain": args.domain,
                         "loss_region": args.loss_region,
+                        "variable_weights": list(variable_weights),
                         "statistics": statistics,
                         "epoch": epoch,
                         "metrics": metrics,

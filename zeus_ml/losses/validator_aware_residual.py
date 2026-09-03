@@ -44,6 +44,7 @@ class ValidatorAwareResidualLoss(nn.Module):
         epsilon: float = 1e-8,
         variable_weights: tuple[float, ...] = VARIABLE_WEIGHTS,
         solar_channel: int | None = SOLAR_CHANNEL,
+        mae_weight: float = 0.5,
     ) -> None:
         super().__init__()
         if not variable_weights:
@@ -58,6 +59,9 @@ class ValidatorAwareResidualLoss(nn.Module):
         self.correction_weight = correction_weight
         self.gate_weight = gate_weight
         self.epsilon = epsilon
+        if not 0.0 <= mae_weight <= 1.0:
+            raise ValueError("mae_weight must be in [0, 1].")
+        self.mae_weight = mae_weight
         self.register_buffer(
             "variable_weights",
             torch.tensor(variable_weights, dtype=torch.float32),
@@ -152,7 +156,9 @@ class ValidatorAwareResidualLoss(nn.Module):
             error.abs() * metric_weights
         ).mean(dim=(-2, -1))
         rmse = torch.sqrt(weighted_mse + self.epsilon)
-        return (rmse + weighted_mae) / 2.0
+        # mae_weight=0.5 reproduces the validator's (rmse + mae) / 2; larger
+        # values tilt training toward the MAE half of the metric.
+        return (1.0 - self.mae_weight) * rmse + self.mae_weight * weighted_mae
 
     @staticmethod
     def _validate(

@@ -39,6 +39,10 @@ N_STEPS = len(STEPS)
 SHAPE = (721, 1440)
 N_MEMBERS = 51  # control + 50 perturbed
 OUT_ROOT = "/Zeus/data/evaluation/aifs_ens_mean"
+EUROPE_CROP_ROOT = "/Zeus/data/evaluation/europe_crops/ens"
+# Matches tools/preprocess_europe_crops.py (28N-79.75N, 40W-51.75E).
+EUROPE_LAT = slice(472, 680)
+EUROPE_LON = slice(560, 928)
 MEMBER_CHUNK = 5
 SAS_MAX_AGE_SEC = 12 * 60
 # 5 members × 3 vars × 61 steps is ~900 MB; a truncated file is far smaller.
@@ -157,16 +161,40 @@ def retrieve_chunk(
     raise RuntimeError(f"retrieve failed after {retries} tries: {last}")
 
 
+def save_europe_crop(full: np.ndarray, crop_root: str, stamp: str) -> str:
+    os.makedirs(crop_root, exist_ok=True)
+    crop = np.ascontiguousarray(full[..., EUROPE_LAT, EUROPE_LON]).astype(np.float16)
+    path = os.path.join(crop_root, f"{stamp}.npy")
+    tmp = path + ".tmp.npy"
+    np.save(tmp, crop)
+    os.replace(tmp, path)
+    return path
+
+
 def fetch_cycle_mean(
     pool: AzureClientPool,
     day: datetime,
     out_root: str,
     retries: int,
+    *,
+    crop_root: str | None = None,
+    discard_full: bool = False,
 ) -> str:
     stamp = day.strftime("%Y%m%dT000000Z")
     target = os.path.join(out_root, f"{stamp}.npy")
-    if os.path.exists(target) and os.path.getsize(target) > 300_000_000:
+    crop_path = os.path.join(crop_root, f"{stamp}.npy") if crop_root else None
+    crop_ready = (
+        crop_path is not None
+        and os.path.exists(crop_path)
+        and os.path.getsize(crop_path) > 1_000_000
+    )
+    full_ready = os.path.exists(target) and os.path.getsize(target) > 300_000_000
+    if full_ready:
+        if crop_root and not crop_ready:
+            save_europe_crop(np.load(target), crop_root, stamp)
         return f"SKIP {stamp}"
+    if crop_ready and discard_full:
+        return f"SKIP {stamp} crop-ready"
     t0 = time.time()
     sums = np.zeros((N_STEPS, len(PARAMS), *SHAPE), np.float32)
     counts = np.zeros((N_STEPS, len(PARAMS)), np.int32)
@@ -207,16 +235,32 @@ def fetch_cycle_mean(
     tmp_npy = target + ".tmp.npy"
     np.save(tmp_npy, mean.astype(np.float16))
     os.replace(tmp_npy, target)
+    extra = ""
+    if crop_root:
+        save_europe_crop(mean, crop_root, stamp)
+        extra = f" crop={os.path.getsize(os.path.join(crop_root, stamp + '.npy'))/1e6:.0f}MB"
+        if discard_full:
+            os.remove(target)
+            extra += " full-discarded"
+            target_size = 0
+        else:
+            target_size = os.path.getsize(target)
+    else:
+        target_size = os.path.getsize(target)
     meta = {
         "cycle": stamp,
         "members": N_MEMBERS,
         "params": PARAMS,
         "steps": STEPS,
         "grid": "zeus lat -90..90, lon -180..179.75",
+        "europe_crop": bool(crop_root),
     }
-    with open(os.path.join(out_root, f"{stamp}.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f)
-    return f"DONE {stamp} {os.path.getsize(target)/1e6:.0f}MB in {time.time()-t0:.0f}s"
+    if not discard_full:
+        with open(os.path.join(out_root, f"{stamp}.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+    return (
+        f"DONE {stamp} {target_size/1e6:.0f}MB{extra} in {time.time()-t0:.0f}s"
+    )
 
 
 def main() -> int:
@@ -225,6 +269,16 @@ def main() -> int:
     parser.add_argument("--end", default="2026-07-22")
     parser.add_argument("--every", type=int, default=7, help="days between cycles")
     parser.add_argument("--out-root", default=OUT_ROOT)
+    parser.add_argument(
+        "--europe-crop-root",
+        default=None,
+        help="If set, also write the 208x368 Europe crop (fp16) used for specialist training.",
+    )
+    parser.add_argument(
+        "--discard-full",
+        action="store_true",
+        help="Delete the 380MB global .npy after cropping. Keep existing weekly files.",
+    )
     parser.add_argument("--source", default="azure")
     parser.add_argument("--retries", type=int, default=6)
     args = parser.parse_args()
@@ -249,7 +303,14 @@ def main() -> int:
     with open(log_path, "a", encoding="utf-8") as log:
         for i, day in enumerate(days, start=1):
             try:
-                line = fetch_cycle_mean(pool, day, args.out_root, args.retries)
+                line = fetch_cycle_mean(
+                    pool,
+                    day,
+                    args.out_root,
+                    args.retries,
+                    crop_root=args.europe_crop_root,
+                    discard_full=args.discard_full,
+                )
             except Exception as exc:  # noqa: BLE001 - keep the batch going
                 line = f"FAIL {day.date()} {type(exc).__name__}: {str(exc)[:160]}"
             if line.startswith("DONE"):
