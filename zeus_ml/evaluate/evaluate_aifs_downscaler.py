@@ -26,6 +26,7 @@ from zeus_ml.datasets.aifs_downscale_dataset import (
 from zeus_ml.models.aifs_downscaler_cnn import (
     MAX_LEAD_HOURS,
     AifsDownscalerCNN,
+    aifs_downscaler_from_checkpoint,
     DownscalerStatistics,
     bracket_for_lead,
     build_downscaler_context,
@@ -236,11 +237,7 @@ def main() -> int:
     statistics = DownscalerStatistics.from_dict(checkpoint["statistics"])
     use_lagged = bool(checkpoint.get("use_lagged", False))
     weather_channels = int(checkpoint.get("weather_channels", 12 if use_lagged else 6))
-    model = AifsDownscalerCNN(
-        hidden_channels=checkpoint["hidden_channels"],
-        weather_channels=weather_channels,
-    )
-    model.load_state_dict(checkpoint["model_state"])
+    model = aifs_downscaler_from_checkpoint(checkpoint)
     model.eval()
     print(
         f"checkpoint epoch={checkpoint.get('epoch')} "

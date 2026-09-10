@@ -15,9 +15,10 @@ one daemon:
   Publisher (main loop, every minute):
     For challenge cycle T (00/06/12/18 UTC) inside its publish window
     [T-45min, T+15min], slice the newest cube at offset delta = T - run_init
-    into 8 artifacts ({var} x {0_48, 0_360}), blosc2-compress, hash with the
-    miner hotkey and publish atomically into the ForecastStore. The miner
-    wakes at T:30, loads this bundle and commits the hashes by T:45.
+    into 8 artifacts ({var} x {0_48, 0_360}), copy the 49h recipe into hours
+    0..48 of each 361h artifact, blosc2-compress, hash with the miner hotkey
+    and publish atomically into the ForecastStore. The miner wakes at T:30,
+    loads this bundle and commits the hashes by T:45.
 
 Hours past the run's +360h horizon are padded by wrapping the final 24
 forecast hours, preserving the diurnal cycle.
@@ -80,9 +81,12 @@ FRESH_SHORT_ENABLED = os.environ.get("ZEUS_FRESH_SHORT", "1") == "1"
 # CNN; blend_50 = per-variable weighted mean of the fresh CNN field and the
 # stale serving field.
 FRESH_SHORT_MODE = os.environ.get("ZEUS_FRESH_SHORT_MODE", "blend_50")
-# Fresh-member weight per channel, fit on 20260826 + 20260801 (both cycles
-# independently preferred 0.4 for t2m and 0.6 for winds; SSRD split 0.4/0.6).
-FRESH_ALPHA_TUV = np.array([0.4, 0.6, 0.6], dtype=np.float32)[:, None, None]
+# Fresh-member weight per channel. 0.05 grid on 20260801T00 + 20260826
+# 00/06/12 (V3 cubes, official scalars). Naive argmin goes to 0.75 from
+# 12z alone; the Pareto step that improves every 0826 cycle without
+# hurting 0801 is 0.45/0.65/0.60. v stays 0.60: 0.65 helps 12z but
+# slightly hurts 00z/06z.
+FRESH_ALPHA_TUV = np.array([0.45, 0.65, 0.60], dtype=np.float32)[:, None, None]
 FRESH_ALPHA_SSRD = 0.5
 # Give up waiting for the fresh single this long after cycle time and
 # publish stale-only. Publishing takes ~12 min; the miner reads at T+30.
@@ -92,6 +96,39 @@ FRESH_TUV = "fresh_short_tuv_f16.npy"
 FRESH_SSRD = "fresh_short_ssrd_f16.npy"
 FRESH_META = "fresh_short.meta.json"
 SHORT_HOURS = 49
+
+# Step-1 MOS bias corrector: per-cell (optionally hour-of-day) mean error of
+# our own published short stack vs ERA5, subtracted from the 49h artifacts at
+# publish time. Empty ZEUS_BIAS_CORRECTOR (default) disables it entirely.
+BIAS_CORRECTOR_PATH = os.environ.get("ZEUS_BIAS_CORRECTOR", "").strip()
+BIAS_MODE = os.environ.get("ZEUS_BIAS_MODE", "flat")  # flat | hod
+BIAS_SHRINK = float(os.environ.get("ZEUS_BIAS_SHRINK", "0.5"))
+BIAS_VARIABLES = tuple(
+    v
+    for v in os.environ.get(
+        "ZEUS_BIAS_VARS",
+        "100m_u_component_of_wind,100m_v_component_of_wind",
+    ).split(",")
+    if v
+)
+
+# Long-window upgrades, validated on a 20260801T12z live-geometry replay:
+#   - ZEUS_BIAS_LONG_VARS: HOD MOS extended to hours 49..360 (2t full-window
+#     C -1.2%, improves every lead segment incl. day 7-15). Only applied to
+#     vars also present in ZEUS_BIAS_VARS.
+#   - TAIL_COMPOSITE_DAYS: wrapped tail hours (349..360 at delta=12) served
+#     as a multi-day diurnal composite instead of repeating the last day.
+#     SSRD 3-day: tail C -32%, full long C -2.2%. 2t 2-day: small gain.
+#     Winds keep the plain wrap (composites scored worse).
+BIAS_LONG_VARIABLES = tuple(
+    v
+    for v in os.environ.get("ZEUS_BIAS_LONG_VARS", "2m_temperature").split(",")
+    if v
+)
+TAIL_COMPOSITE_DAYS = {
+    "surface_solar_radiation_downwards": 3,
+    "2m_temperature": 2,
+}
 
 logger = logging.getLogger("zeus.bundle_builder")
 
@@ -283,15 +320,62 @@ def fetch_and_bundle(run_time: datetime) -> Path | None:
 _COMPOSER = None
 _COMPOSER_LOCK = threading.Lock()
 
+_BIAS = None
+
+
+def get_bias_corrector():
+    """Load the bias maps once. Returns None when disabled."""
+    global _BIAS
+    if _BIAS is None:
+        if not BIAS_CORRECTOR_PATH:
+            _BIAS = False
+        else:
+            data = np.load(BIAS_CORRECTOR_PATH)
+            _BIAS = {
+                "flat": data["flat"].astype(np.float32),   # (3, 721, 1440)
+                "hod": data["hod"].astype(np.float32),     # (24, 3, 721, 1440)
+            }
+            logger.info(
+                "bias corrector loaded %s (mode=%s shrink=%.2f vars=%s)",
+                BIAS_CORRECTOR_PATH,
+                BIAS_MODE,
+                BIAS_SHRINK,
+                ",".join(BIAS_VARIABLES),
+            )
+    return _BIAS or None
+
+
+def apply_bias_correction(
+    array: np.ndarray, variable: str, cycle_time: datetime
+) -> np.ndarray:
+    """Subtract shrink x fitted mean error from a short (49h) tuv artifact."""
+    bias = get_bias_corrector()
+    if bias is None or variable not in BIAS_VARIABLES:
+        return array
+    channel = VARIABLE_CHANNEL[variable]
+    if BIAS_MODE == "hod":
+        idx = (cycle_time.hour + np.arange(array.shape[0])) % 24
+        correction = bias["hod"][idx, channel]
+    else:
+        correction = bias["flat"][channel][None]
+    return (
+        array.astype(np.float32) - np.float32(BIAS_SHRINK) * correction
+    ).astype(np.float16)
+
 
 def get_composer():
-    """Shared ForecastComposer; loads the v2 CNN + statics once."""
+    """Shared ForecastComposer; loads the global CNN + statics once."""
     global _COMPOSER
     with _COMPOSER_LOCK:
         if _COMPOSER is None:
             from zeus_ml.serve.compose_forecast import ForecastComposer
 
             _COMPOSER = ForecastComposer()
+            logger.info(
+                "composer loaded global_checkpoint=%s lagged=%s",
+                _COMPOSER.config.global_checkpoint,
+                _COMPOSER.g_lagged,
+            )
         return _COMPOSER
 
 
@@ -576,7 +660,8 @@ def build_hourly_cube(run_dir: Path) -> None:
         os.replace(tmp, run_dir / CUBE_SSRD3H)
         ssrd3h_built = True
 
-    model_name = "aifs_ens_mean+downscaler_v2+zenith_ssrd"
+    ckpt_stem = Path(composer.config.global_checkpoint).stem
+    model_name = f"aifs_ens_mean+{ckpt_stem}+zenith_ssrd"
     if ssrd3h_built:
         model_name += "+ifs_ssrd3h60"
     if wind_blend_applied:
@@ -746,11 +831,13 @@ def publish_bundle(
 
     started = time.monotonic()
     indices = tail_wrapped_indices(delta)
+    wrapped_hours = np.nonzero(delta + np.arange(361) > 360)[0]
     tuv = np.load(cube_dir / CUBE_TUV, mmap_mode="r")
     ssrd = np.load(cube_dir / CUBE_SSRD, mmap_mode="r")
 
-    # Short-window SSRD: 0.4 * (6h AIFS/IFS mix) + 0.6 * (IFS-ENS 3h zenith),
-    # verified -8.7/-9.1% combined vs the 6h mix on 20260826/20260801. Falls
+    # Short-window SSRD: 0.4 * (6h AIFS/IFS mix) + 0.6 * (IFS-ENS 3h zenith).
+    # 0.05 grid on 0801+0826 reconfirmed 0.4 as the 0826 holdout min
+    # (0801 prefers 0.45 by 0.03 combined; not enough to move). Falls
     # back to the fresh blend / stale slice when the 3h cube is unavailable.
     short_ssrd = None
     ssrd3h_path = cube_dir / CUBE_SSRD3H
@@ -786,32 +873,85 @@ def publish_bundle(
                 long_array = np.ascontiguousarray(
                     tuv[indices, channel], dtype=np.float16
                 )
+            comp_days = TAIL_COMPOSITE_DAYS.get(variable, 1)
+            if comp_days > 1 and wrapped_hours.size:
+                # Multi-day diurnal composite for the wrapped tail hours.
+                for h in wrapped_hours:
+                    lead = int(indices[h])
+                    if variable == SSRD_VARIABLE:
+                        stack = [
+                            np.asarray(ssrd[lead - 24 * k], np.float32)
+                            for k in range(comp_days)
+                        ]
+                    else:
+                        stack = [
+                            np.asarray(tuv[lead - 24 * k, channel], np.float32)
+                            for k in range(comp_days)
+                        ]
+                    long_array[h] = np.mean(stack, axis=0).astype(np.float16)
             if not np.isfinite(long_array).all():
                 raise ValueError(f"{variable}: non-finite values in cube slice")
             if variable == SSRD_VARIABLE:
                 # Validators now penalty any SSRD cell < 0 (Orpheus-AI/Zeus#83 / #87).
                 long_array = np.clip(long_array, 0.0, None)
-            for hours, window in ((361, LONG_CHALLENGE), (49, SHORT_CHALLENGE)):
-                array = None
-                source_time = run_time
-                if hours == SHORT_HOURS:
-                    if variable == SSRD_VARIABLE and short_ssrd is not None:
-                        array = np.ascontiguousarray(short_ssrd[:hours])
-                    elif use_fresh:
-                        if variable == SSRD_VARIABLE:
-                            array = np.ascontiguousarray(
-                                fresh_ssrd[:hours], dtype=np.float16
-                            )
-                        else:
-                            array = np.ascontiguousarray(
-                                fresh_tuv[:hours, VARIABLE_CHANNEL[variable]],
-                                dtype=np.float16,
-                            )
-                        source_time = fresh_run
-                if array is None:
-                    array = np.ascontiguousarray(long_array[:hours])
+
+            short_source_time = run_time
+            short_array = None
+            if variable == SSRD_VARIABLE and short_ssrd is not None:
+                short_array = np.ascontiguousarray(short_ssrd[:SHORT_HOURS])
+            elif use_fresh:
                 if variable == SSRD_VARIABLE:
-                    array = np.clip(array, 0.0, None).astype(np.float16, copy=False)
+                    short_array = np.ascontiguousarray(
+                        fresh_ssrd[:SHORT_HOURS], dtype=np.float16
+                    )
+                else:
+                    short_array = np.ascontiguousarray(
+                        fresh_tuv[:SHORT_HOURS, VARIABLE_CHANNEL[variable]],
+                        dtype=np.float16,
+                    )
+                short_source_time = fresh_run
+            if short_array is None:
+                short_array = np.ascontiguousarray(long_array[:SHORT_HOURS])
+            if variable != SSRD_VARIABLE:
+                short_array = apply_bias_correction(
+                    short_array, variable, cycle_time
+                )
+                if not np.isfinite(short_array).all():
+                    raise ValueError(
+                        f"{variable}: bias correction produced non-finite values"
+                    )
+            if variable == SSRD_VARIABLE:
+                short_array = np.clip(short_array, 0.0, None).astype(
+                    np.float16, copy=False
+                )
+                long_array = np.clip(long_array, 0.0, None)
+
+            # Long-lead MOS: reuse the short-window HOD maps/shrink on
+            # hours 0..360 (hours 0..48 are then overwritten by the short
+            # prefix, which carries its own single application).
+            if variable in BIAS_LONG_VARIABLES and variable != SSRD_VARIABLE:
+                long_array = apply_bias_correction(
+                    long_array, variable, cycle_time
+                )
+                if not np.isfinite(long_array).all():
+                    raise ValueError(
+                        f"{variable}: long bias correction non-finite"
+                    )
+
+            # Long challenge still scores hours 0..48. Those hours on the
+            # stale cube are worse than the 49h artifact (fresh blend + MOS
+            # / IFS 3h SSRD). Copy the short recipe into the long prefix so
+            # both windows serve the same 0-48h field. Hours 49..360 stay
+            # on the stale cube (+ IFS wind ramp after 72h).
+            long_array = np.ascontiguousarray(long_array)
+            long_array[:SHORT_HOURS] = np.ascontiguousarray(
+                short_array[:SHORT_HOURS]
+            )
+
+            for hours, window, array, source_time in (
+                (361, LONG_CHALLENGE, long_array, run_time),
+                (49, SHORT_CHALLENGE, short_array, short_source_time),
+            ):
                 compressed = compress_prediction(array)
                 writer.write_artifact(
                     make_state_key(variable, window[0], window[1]),
@@ -823,7 +963,7 @@ def publish_bundle(
                     commitment_hash=prediction_hash(compressed, hotkey),
                     source_valid_time_utc=source_time.isoformat(),
                 )
-            del long_array
+            del long_array, short_array
         manifest = writer.finalize(
             metadata={
                 "model": "aifs_ens_mean+downscaler_v2+zenith_ssrd",
@@ -840,6 +980,19 @@ def publish_bundle(
                 "short_ssrd_source": (
                     "ifs3h_blend_60" if short_ssrd is not None
                     else ("fresh_blend" if use_fresh else "stale")
+                ),
+                "long_prefix_from_short": True,
+                "long_bias_vars": list(BIAS_LONG_VARIABLES),
+                "long_tail_composite_days": TAIL_COMPOSITE_DAYS,
+                "bias_corrector": (
+                    {
+                        "path": BIAS_CORRECTOR_PATH,
+                        "mode": BIAS_MODE,
+                        "shrink": BIAS_SHRINK,
+                        "variables": list(BIAS_VARIABLES),
+                    }
+                    if get_bias_corrector() is not None
+                    else None
                 ),
                 "source_variables": {},
             }

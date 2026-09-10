@@ -7,6 +7,11 @@ is wrong in two ways: it misses the diurnal curvature between the brackets
 model's own bias at the bracket times. This module predicts both at once as a
 gated residual on top of the interpolation, so an untrained network reproduces
 plain linear interpolation exactly.
+
+When ``use_temporal_mix`` is on, a second zero-init head (gated by ``4f(1-f)``)
+offsets that linear blend using the 6h tendency, so mid-hours can come from
+both anchors instead of ``(1-f)*left + f*right``. Off on a V3 checkpoint, so
+live serving does not change until a mix-trained weight file is loaded.
 """
 
 from __future__ import annotations
@@ -247,6 +252,7 @@ class AifsDownscalerCNN(nn.Module):
         weather_channels: int = WEATHER_CHANNELS,
         static_channels: int = STATIC_CHANNELS,
         context_channels: int = CONTEXT_FEATURES,
+        use_temporal_mix: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 < initial_gate < 1.0:
@@ -254,6 +260,7 @@ class AifsDownscalerCNN(nn.Module):
         self.weather_channels = weather_channels
         self.static_channels = static_channels
         self.context_channels = context_channels
+        self.use_temporal_mix = bool(use_temporal_mix)
         self.dilations = tuple(int(value) for value in dilations)
         self.stem = nn.Sequential(
             SphericalConv2d(weather_channels + static_channels, hidden_channels),
@@ -271,6 +278,9 @@ class AifsDownscalerCNN(nn.Module):
         )
         self.short_heads = DownscalerHeads(hidden_channels)
         self.long_heads = DownscalerHeads(hidden_channels)
+        self.mix_heads = (
+            DownscalerHeads(hidden_channels) if self.use_temporal_mix else None
+        )
         self.spatial_gate = nn.Conv2d(hidden_channels, 3, kernel_size=1)
         self.context_gate = nn.Linear(context_channels, 3)
         self._initialize_gate(initial_gate)
@@ -290,6 +300,8 @@ class AifsDownscalerCNN(nn.Module):
         # evidence.
         self.short_heads.zero_initialize()
         self.long_heads.zero_initialize()
+        if self.mix_heads is not None:
+            self.mix_heads.zero_initialize()
 
     def forward(
         self,
@@ -335,9 +347,34 @@ class AifsDownscalerCNN(nn.Module):
         gate_logits = self.spatial_gate(features)
         gate_logits = gate_logits + self.context_gate(context)[:, :, None, None]
         gate = torch.sigmoid(gate_logits)
+        correction = residual * gate
+        if self.mix_heads is not None:
+            # 4f(1-f) is the last context feature: 0 on the 6h brackets, 1 at
+            # the mid-hour. Weather channels 3:6 are (right-left)/delta_std,
+            # so this term shifts the linear blend using both anchors. Added
+            # after the spatial gate — V3's gate sits near 0.1 and would hide
+            # a new head that went through it.
+            peak = context[:, -1].view(-1, 1, 1, 1)
+            correction = correction + peak * self.mix_heads(features) * weather[:, 3:6]
         return DownscalerOutput(
-            correction=residual * gate,
+            correction=correction,
             gate=gate,
             ungated_residual=residual,
             horizon_mix=horizon_mix,
         )
+
+
+def aifs_downscaler_from_checkpoint(checkpoint: dict) -> AifsDownscalerCNN:
+    """Build a downscaler that matches a checkpoint, including optional mix heads."""
+
+    use_lagged = bool(checkpoint.get("use_lagged", False))
+    weather_channels = int(
+        checkpoint.get("weather_channels", 12 if use_lagged else 6)
+    )
+    model = AifsDownscalerCNN(
+        hidden_channels=int(checkpoint["hidden_channels"]),
+        weather_channels=weather_channels,
+        use_temporal_mix=bool(checkpoint.get("use_temporal_mix", False)),
+    )
+    model.load_state_dict(checkpoint["model_state"])
+    return model

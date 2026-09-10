@@ -83,6 +83,20 @@ def build_split(cycles: list[str]) -> Split:
             for start, end in blocks
         ):
             train.append(key)
+    if not validation:
+        # ERA5 coverage misses every seasonal block (e.g. a summer-only
+        # slice). Fall back to a chronological holdout: newest ~15% of
+        # cycles validate, training keeps a 15-day buffer before them.
+        ordered = sorted(cycles, key=as_date)
+        n_val = max(2, len(ordered) // 7)
+        validation = ordered[-n_val:]
+        cutoff = as_date(validation[0]) - timedelta(days=BUFFER_DAYS)
+        train = [key for key in ordered[:-n_val] if as_date(key) <= cutoff]
+        print(
+            f"no cycles inside the seasonal validation blocks; using a "
+            f"chronological holdout of the newest {n_val} cycles instead",
+            flush=True,
+        )
     return Split(train=tuple(train), validation=tuple(validation))
 
 
@@ -121,11 +135,20 @@ def evaluate(
     entries: list[tuple],
     residual_scales: torch.Tensor,
     device: torch.device = torch.device("cpu"),
+    variable_weights: tuple[float, ...] = VARIABLE_WEIGHTS,
 ) -> dict[str, float]:
     model.eval()
     corrected_sum = np.zeros(len(VARIABLES))
     raw_sum = np.zeros(len(VARIABLES))
     gate_sum = 0.0
+    # Half-open bands; lead 72 belongs to the long window it is selected on.
+    bands = {
+        "h0_72": (0, 72),
+        "h72_360": (72, 361),
+    }
+    band_corr = {name: np.zeros(len(VARIABLES)) for name in bands}
+    band_raw = {name: np.zeros(len(VARIABLES)) for name in bands}
+    band_n = {name: 0 for name in bands}
     for cycle, lead in entries:
         item = dataset.full_globe_item(cycle, lead)
         item = {k: v.to(device) if torch.is_tensor(v) else v
@@ -135,24 +158,31 @@ def evaluate(
                 item["model_input"], item["context"], item["static_features"]
             )
         corrected = item["raw"] + output.correction * residual_scales
-        corrected_sum += (
+        corr = (
             combined_error(corrected, item["truth"], item["metric_weights"])
             .squeeze(0)
             .cpu()
             .numpy()
         )
-        raw_sum += (
+        raw = (
             combined_error(item["raw"], item["truth"], item["metric_weights"])
             .squeeze(0)
             .cpu()
             .numpy()
         )
+        corrected_sum += corr
+        raw_sum += raw
         gate_sum += float(output.gate.mean())
+        for name, (lo, hi) in bands.items():
+            if lo <= lead < hi:
+                band_corr[name] += corr
+                band_raw[name] += raw
+                band_n[name] += 1
     model.train()
     n = len(entries)
     corrected_mean = corrected_sum / n
     raw_mean = raw_sum / n
-    weights = np.asarray(VARIABLE_WEIGHTS)
+    weights = np.asarray(variable_weights, dtype=np.float64)
     metrics = {"gate_mean": gate_sum / n}
     for i, key in enumerate(SHORT_NAMES):
         metrics[f"{key}_corrected"] = float(corrected_mean[i])
@@ -164,6 +194,21 @@ def evaluate(
     metrics["weighted_gain_pct"] = float(
         100.0 * (1.0 - (corrected_mean / raw_mean * weights).sum() / weights.sum())
     )
+    metrics["wind_corrected"] = 0.5 * (
+        metrics["u100_corrected"] + metrics["v100_corrected"]
+    )
+    for name, count in band_n.items():
+        if count == 0:
+            continue
+        cmean = band_corr[name] / count
+        rmean = band_raw[name] / count
+        metrics[f"{name}_n"] = int(count)
+        for i, key in enumerate(SHORT_NAMES):
+            metrics[f"{name}_{key}_corrected"] = float(cmean[i])
+            metrics[f"{name}_{key}_gain_pct"] = float(
+                100.0 * (rmean[i] - cmean[i]) / max(rmean[i], 1e-9)
+            )
+        metrics[f"{name}_wind_corrected"] = 0.5 * float(cmean[1] + cmean[2])
     return metrics
 
 
@@ -202,6 +247,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Feed yesterday's run at the same valid time as extra channels.",
     )
     parser.add_argument(
+        "--use-temporal-mix",
+        action="store_true",
+        help="Add the fraction-aware temporal head: a zero-init 4f(1-f)-gated "
+        "term on the 6h tendency, so mid-hours are predicted from both "
+        "anchors instead of pure linear interpolation.",
+    )
+    parser.add_argument(
+        "--mix-head-only",
+        action="store_true",
+        help="Freeze the V3 trunk and train only mix_heads (requires "
+        "--use-temporal-mix). Isolates the mid-hour interpolator.",
+    )
+    parser.add_argument(
         "--statistics-from",
         default=None,
         help="Reuse a statistics JSON from a previous run.",
@@ -230,8 +288,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="Oversample leads off the 6h steps by this factor.",
     )
     parser.add_argument(
+        "--gradient-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the spatial-gradient sharpness term in the loss "
+        "(0 disables; attacks the ~80%% gradient-energy smoothing).",
+    )
+    parser.add_argument(
+        "--long-lead-boost",
+        type=float,
+        default=0.0,
+        help="Oversample leads past --long-lead-start by this factor "
+        "(the 361h window carries 80%% of the incentive).",
+    )
+    parser.add_argument("--long-lead-start", type=int, default=72)
+    parser.add_argument(
+        "--speed-weight",
+        type=float,
+        default=0.0,
+        help="Weight of the 100m wind-speed MAE term (0 disables; counters "
+        "the ensemble-mean |V| damping that u/v errors alone do not see).",
+    )
+    parser.add_argument(
+        "--variable-weights",
+        default=None,
+        help="Comma-separated loss/selection weights for 2t,100u,100v "
+        f"(default {','.join(str(w) for w in VARIABLE_WEIGHTS)}; "
+        "e.g. 0.2,0.4,0.4 to tilt selection toward wind).",
+    )
+    parser.add_argument(
+        "--wind-no-regret-weight",
+        type=float,
+        default=0.0,
+        help="Extra no-regret on 100u/100v only (stops V3-style wind regression).",
+    )
+    parser.add_argument(
+        "--select-on",
+        choices=("weighted", "wind", "wind_long"),
+        default="weighted",
+        help="Checkpoint on full weighted error, mean 100u/100v, or 100u/100v "
+        "for leads >= 72h (360h wind).",
+    )
+    parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    parser.add_argument(
+        "--min-cycles",
+        type=int,
+        default=8,
+        help="Minimum usable ENS cycles with full ERA5 windows (lower only "
+        "for smoke tests).",
     )
     parser.add_argument("--europe-fraction", type=float, default=0.35)
     parser.add_argument("--validation-cycles", type=int, default=12)
@@ -239,11 +346,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stat-items", type=int, default=48)
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--grib-cache-size",
+        type=int,
+        default=None,
+        help="Decoded AIFS-single cycles kept in RAM (default 3 with "
+        "--use-lagged). Raise to the train-set size to avoid re-decoding.",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.mix_head_only and not args.use_temporal_mix:
+        raise SystemExit("--mix-head-only requires --use-temporal-mix")
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     output_root = Path(args.output_root)
@@ -275,7 +391,7 @@ def main() -> int:
         f"ERA5 coverage: {len(all_cycles)} usable cycles, {skipped} skipped",
         flush=True,
     )
-    if len(all_cycles) < 8:
+    if len(all_cycles) < args.min_cycles:
         raise SystemExit(
             "Not enough cycles with full ERA5 windows to train. "
             "Fetch more ERA5 days and retry."
@@ -296,6 +412,26 @@ def main() -> int:
         flush=True,
     )
 
+    init_payload = None
+    if args.init_from:
+        init_payload = torch.load(
+            args.init_from, map_location="cpu", weights_only=False
+        )
+        ckpt_hidden = init_payload.get("hidden_channels")
+        if ckpt_hidden is not None and int(ckpt_hidden) != args.hidden_channels:
+            print(
+                f"overriding --hidden-channels {args.hidden_channels} -> "
+                f"{ckpt_hidden} from {args.init_from}",
+                flush=True,
+            )
+            args.hidden_channels = int(ckpt_hidden)
+        if init_payload.get("use_lagged") and not args.use_lagged:
+            print("enabling --use-lagged to match checkpoint", flush=True)
+            args.use_lagged = True
+        if init_payload.get("use_temporal_mix") and not args.use_temporal_mix:
+            print("enabling --use-temporal-mix to match checkpoint", flush=True)
+            args.use_temporal_mix = True
+
     common = dict(
         aifs_root=args.aifs_root,
         ens_root=args.ens_root,
@@ -305,7 +441,11 @@ def main() -> int:
         tiles_per_item=args.tiles_per_item,
         europe_fraction=args.europe_fraction,
         use_lagged=args.use_lagged,
-        grib_cache_size=3 if args.use_lagged else 2,
+        grib_cache_size=(
+            args.grib_cache_size
+            if args.grib_cache_size is not None
+            else (3 if args.use_lagged else 2)
+        ),
         geo_mode=args.geo_mode,
     )
     stats_path = output_root / f"{args.name}.statistics.json"
@@ -313,11 +453,24 @@ def main() -> int:
         stats_path.write_text(
             Path(args.statistics_from).read_text(encoding="utf-8"), encoding="utf-8"
         )
+    if (
+        init_payload is not None
+        and isinstance(init_payload.get("statistics"), dict)
+        and not stats_path.is_file()
+        and not args.statistics_from
+    ):
+        stats_path.write_text(
+            json.dumps(init_payload["statistics"], indent=2), encoding="utf-8"
+        )
     if stats_path.is_file():
         statistics = DownscalerStatistics.from_dict(
             json.loads(stats_path.read_text(encoding="utf-8"))
         )
         print("loaded statistics", statistics.to_dict(), flush=True)
+    elif init_payload is not None and isinstance(init_payload.get("statistics"), dict):
+        statistics = DownscalerStatistics.from_dict(init_payload["statistics"])
+        stats_path.write_text(json.dumps(statistics.to_dict(), indent=2), "utf-8")
+        print("loaded statistics from checkpoint", statistics.to_dict(), flush=True)
     else:
         print(f"estimating statistics from {args.stat_items} cycles ...", flush=True)
         raw_dataset = AifsDownscaleDataset(
@@ -340,6 +493,8 @@ def main() -> int:
         leads_per_cycle=args.leads_per_cycle,
         seed=args.seed,
         midhour_boost=args.midhour_boost,
+        long_lead_boost=args.long_lead_boost,
+        long_lead_start=args.long_lead_start,
     )
     loader = DataLoader(
         train_dataset,
@@ -356,30 +511,84 @@ def main() -> int:
     model = AifsDownscalerCNN(
         hidden_channels=args.hidden_channels,
         weather_channels=weather_channels,
+        use_temporal_mix=args.use_temporal_mix,
     )
-    if args.init_from:
-        init = torch.load(args.init_from, map_location="cpu", weights_only=False)
-        model.load_state_dict(init["model_state"])
+    if init_payload is not None:
+        missing, unexpected = model.load_state_dict(
+            init_payload["model_state"], strict=False
+        )
+        # Warm-starting a temporal-mix model from a mix-less checkpoint
+        # (e.g. V3) legitimately leaves the mix heads at their zero init;
+        # anything else missing or unexpected is a real mismatch.
+        fresh = {key for key in missing if key.startswith("mix_heads.")}
+        if unexpected or set(missing) - fresh:
+            raise RuntimeError(
+                f"checkpoint mismatch missing={sorted(set(missing) - fresh)} "
+                f"unexpected={list(unexpected)}"
+            )
+        if fresh:
+            print(
+                f"temporal-mix heads not in checkpoint; keeping "
+                f"{len(fresh)} tensors at zero init (starts as exact "
+                "linear interpolation)",
+                flush=True,
+            )
         print(
-            f"warm-started from {args.init_from} (epoch {init.get('epoch')})",
+            f"warm-started from {args.init_from} "
+            f"(epoch {init_payload.get('epoch')}, "
+            f"hidden={args.hidden_channels}, "
+            f"weather={weather_channels}, "
+            f"temporal_mix={args.use_temporal_mix})",
             flush=True,
         )
     n_params = sum(p.numel() for p in model.parameters())
     device = torch.device(args.device)
     model = model.to(device)
+    trainable = list(model.parameters())
+    if args.mix_head_only:
+        if model.mix_heads is None:
+            raise RuntimeError("mix-head-only requested but mix_heads is missing")
+        for param in model.parameters():
+            param.requires_grad = False
+        for param in model.mix_heads.parameters():
+            param.requires_grad = True
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        n_train = sum(p.numel() for p in trainable)
+        print(
+            f"mix-head-only: frozen trunk, {n_train} trainable / {n_params} total",
+            flush=True,
+        )
     print(f"model: {n_params} parameters, tile {args.tile_size}, "
           f"device {device}", flush=True)
+    variable_weights = tuple(VARIABLE_WEIGHTS)
+    if args.variable_weights:
+        parsed = tuple(float(x) for x in args.variable_weights.split(","))
+        if len(parsed) != len(VARIABLES) or min(parsed) < 0.0 or sum(parsed) <= 0:
+            raise ValueError(
+                f"--variable-weights needs {len(VARIABLES)} non-negative values"
+            )
+        variable_weights = parsed
+        print(f"variable weights: {variable_weights}", flush=True)
+    wind_channels = (
+        VARIABLES.index("100m_u_component_of_wind"),
+        VARIABLES.index("100m_v_component_of_wind"),
+    )
     criterion = ValidatorAwareResidualLoss(
-        variable_weights=VARIABLE_WEIGHTS,
+        variable_weights=variable_weights,
         solar_channel=None,
         no_regret_weight=args.no_regret_weight,
         mae_weight=args.mae_weight,
+        gradient_weight=args.gradient_weight,
+        speed_weight=args.speed_weight,
+        wind_channels=wind_channels,
+        wind_no_regret_weight=args.wind_no_regret_weight,
+        gradient_wind_only=True,
     ).to(device)
     residual_scales = torch.tensor(statistics.residual_std, dtype=torch.float32).view(
         len(VARIABLES), 1, 1
     ).to(device)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+        trainable, lr=args.learning_rate, weight_decay=args.weight_decay
     )
     steps_per_epoch = len(sampler)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -393,7 +602,10 @@ def main() -> int:
         f"validating baseline on {len(val_entries)} full-globe samples ...",
         flush=True,
     )
-    baseline = evaluate(model, val_dataset, val_entries, residual_scales, device)
+    baseline = evaluate(
+        model, val_dataset, val_entries, residual_scales, device,
+        variable_weights=variable_weights,
+    )
     print(
         "  linear interpolation combined error  "
         + "  ".join(f"{k}={baseline[f'{k}_baseline']:.4f}" for k in SHORT_NAMES),
@@ -445,7 +657,8 @@ def main() -> int:
                         flush=True,
                     )
             metrics = evaluate(
-                model, val_dataset, val_entries, residual_scales, device
+                model, val_dataset, val_entries, residual_scales, device,
+                variable_weights=variable_weights,
             )
             metrics["epoch"] = epoch
             metrics["train_loss"] = running["loss"] / max(steps_per_epoch, 1)
@@ -458,11 +671,18 @@ def main() -> int:
                 f"u100={metrics['u100_gain_pct']:+.2f}% "
                 f"v100={metrics['v100_gain_pct']:+.2f}% "
                 f"weighted={metrics['weighted_gain_pct']:+.2f}% "
+                f"wind={metrics['wind_corrected']:.4f} "
+                f"wind72-360={metrics.get('h72_360_wind_corrected', float('nan')):.4f} "
                 f"gate={metrics['gate_mean']:.3f} "
                 f"({metrics['seconds']/60:.1f} min)",
                 flush=True,
             )
-            score = metrics["weighted_corrected"]
+            if args.select_on == "wind":
+                score = metrics["wind_corrected"]
+            elif args.select_on == "wind_long":
+                score = metrics.get("h72_360_wind_corrected", metrics["wind_corrected"])
+            else:
+                score = metrics["weighted_corrected"]
             if score < best:
                 best = score
                 torch.save(
@@ -470,10 +690,12 @@ def main() -> int:
                         "model_state": model.state_dict(),
                         "statistics": statistics.to_dict(),
                         "variables": list(VARIABLES),
-                        "variable_weights": list(VARIABLE_WEIGHTS),
+                        "variable_weights": list(variable_weights),
                         "hidden_channels": args.hidden_channels,
                         "weather_channels": weather_channels,
                         "use_lagged": args.use_lagged,
+                        "use_temporal_mix": args.use_temporal_mix,
+                        "mix_head_only": args.mix_head_only,
                         "ens_mode": bool(args.ens_root),
                         "geo_mode": args.geo_mode,
                         "epoch": epoch,

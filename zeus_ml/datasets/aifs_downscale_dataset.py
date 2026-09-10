@@ -501,6 +501,8 @@ class CycleBlockSampler(Sampler[int]):
         leads_per_cycle: int,
         seed: int = 0,
         midhour_boost: float = 0.0,
+        long_lead_boost: float = 0.0,
+        long_lead_start: int = 72,
     ) -> None:
         self.n_cycles = len(dataset.cycles)
         self.n_leads = MAX_LEAD_HOURS + 1
@@ -510,8 +512,13 @@ class CycleBlockSampler(Sampler[int]):
         self.epoch = 0
         # Production pays 15-19% extra MAE at hours off the 6h model steps;
         # midhour_boost > 0 oversamples those leads during training.
+        leads = np.arange(self.n_leads)
         weights = np.ones(self.n_leads, dtype=np.float64)
-        weights[np.arange(self.n_leads) % 6 != 0] += float(midhour_boost)
+        weights[leads % 6 != 0] += float(midhour_boost)
+        # The 361h window carries 80% of the incentive and its error mass
+        # sits at long leads; long_lead_boost > 0 oversamples leads past
+        # long_lead_start so the corrector sees day 3-15 more often.
+        weights[leads > int(long_lead_start)] += float(long_lead_boost)
         self.lead_probs = weights / weights.sum()
 
     def set_epoch(self, epoch: int) -> None:

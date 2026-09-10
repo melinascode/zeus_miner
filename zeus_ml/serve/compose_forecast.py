@@ -20,7 +20,8 @@ Score both; serve the winner.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -32,8 +33,8 @@ from zeus_ml.models.aifs_downscaler_cnn import (
     FULL_HEIGHT,
     FULL_WIDTH,
     MAX_LEAD_HOURS,
-    AifsDownscalerCNN,
     DownscalerStatistics,
+    aifs_downscaler_from_checkpoint,
     bracket_for_lead,
     build_downscaler_context,
     build_downscaler_static_features,
@@ -98,8 +99,15 @@ class ComposerConfig:
     statistics: str = (
         "/Zeus/data/evaluation/training/aifs_downscaler_v2_ens.statistics.json"
     )
-    global_checkpoint: str = (
-        "/Zeus/data/evaluation/training/aifs_downscaler_v2_ens.pt"
+    # Override with ZEUS_GLOBAL_CHECKPOINT (bundle builder only). Default is
+    # the live v2 ENS CNN; unset/empty keeps this path so a missing flag is a
+    # no-op revert.
+    global_checkpoint: str = field(
+        default_factory=lambda: os.environ.get(
+            "ZEUS_GLOBAL_CHECKPOINT",
+            "/Zeus/data/evaluation/training/aifs_downscaler_v2_ens.pt",
+        )
+        or "/Zeus/data/evaluation/training/aifs_downscaler_v2_ens.pt"
     )
     europe_checkpoint: str = (
         "/Zeus/data/evaluation/training/europe_resunet_ens_t2m.pt"
@@ -196,11 +204,7 @@ class ForecastComposer:
         self.g_stats = DownscalerStatistics.from_dict(ck["statistics"])
         self.g_mean, self.g_std, self.g_delta, self.g_resid = self.g_stats.tensors()
         self.g_lagged = bool(ck.get("use_lagged", False))
-        weather = int(ck.get("weather_channels", 12 if self.g_lagged else 6))
-        self.global_model = AifsDownscalerCNN(
-            hidden_channels=ck["hidden_channels"], weather_channels=weather
-        )
-        self.global_model.load_state_dict(ck["model_state"])
+        self.global_model = aifs_downscaler_from_checkpoint(ck)
         self.global_model.eval()
         self.land, self.orography, self.roughness = load_static_maps(
             self.config.global_static

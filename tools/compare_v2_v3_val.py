@@ -22,7 +22,7 @@ from zeus_ml.datasets.aifs_downscale_dataset import (
 )
 from zeus_ml.models.aifs_downscaler_cnn import (
     MAX_LEAD_HOURS,
-    AifsDownscalerCNN,
+    aifs_downscaler_from_checkpoint,
     DownscalerStatistics,
 )
 from zeus_ml.train.train_aifs_downscaler import (
@@ -84,12 +84,7 @@ def main() -> int:
     print(f"validation: {len(dataset.cycles)} cycles, {len(entries)} samples")
     for name, path in CHECKPOINTS.items():
         ck = torch.load(path, map_location="cpu", weights_only=False)
-        model = AifsDownscalerCNN(
-            hidden_channels=ck["hidden_channels"],
-            weather_channels=ck["weather_channels"],
-        )
-        model.load_state_dict(ck["model_state"])
-        model = model.to(device)
+        model = aifs_downscaler_from_checkpoint(ck).to(device)
         metrics = evaluate(model, dataset, entries, residual_scales, device)
         corrected = {k: round(metrics[f"{k}_corrected"], 4) for k in SHORT_NAMES}
         baseline = {k: round(metrics[f"{k}_baseline"], 4) for k in SHORT_NAMES}
